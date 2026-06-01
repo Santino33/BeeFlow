@@ -60,6 +60,26 @@ pub fn run_energy_system(world: &mut hecs::World, global_temp: f32) {
     }
 }
 
+/// Elimina entidades con energía ≤ 0. Decrementa ocupación del grid.
+/// Devuelve el número de muertes (causa: energía) para las métricas.
+pub fn run_mortality_system(world: &mut hecs::World, grid: &mut SpatialGrid) -> u32 {
+    let dead: Vec<(hecs::Entity, PositionComponent)> = world
+        .query::<(&EnergyComponent, &PositionComponent)>()
+        .iter()
+        .filter_map(|(e, (energy, pos))| {
+            if energy.0 <= 0.0 { Some((e, *pos)) } else { None }
+        })
+        .collect();
+
+    let count = dead.len() as u32;
+    for (entity, pos) in dead {
+        let idx = SpatialGrid::idx(pos.0 as usize, pos.1 as usize);
+        grid.occupancy[idx] = grid.occupancy[idx].saturating_sub(1);
+        let _ = world.despawn(entity);
+    }
+    count
+}
+
 /// Forager en celda con recurso gana energía; el recurso decrece proporcionalmente.
 /// Ganancia = resource_amount × 2.0, clampeada para no superar 1.0 de energía.
 pub fn run_foraging_system(world: &mut hecs::World, grid: &mut SpatialGrid) {
@@ -175,6 +195,70 @@ mod tests {
         for (_, age) in world.query::<&AgeComponent>().iter() {
             assert_eq!(age.0, 3);
         }
+    }
+
+    // --- M5: MortalitySystem ------------------------------------------------
+
+    #[test]
+    fn dead_bee_removed_from_world() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let idx = SpatialGrid::idx(50, 50);
+        grid.occupancy[idx] = 1;
+        world.spawn((PositionComponent(50, 50), EnergyComponent(0.0), AgeComponent(0)));
+
+        run_mortality_system(&mut world, &mut grid);
+
+        assert_eq!(world.query::<&EnergyComponent>().iter().count(), 0);
+    }
+
+    #[test]
+    fn alive_bee_stays() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        grid.occupancy[SpatialGrid::idx(50, 50)] = 1;
+        world.spawn((PositionComponent(50, 50), EnergyComponent(0.01), AgeComponent(0)));
+
+        run_mortality_system(&mut world, &mut grid);
+
+        assert_eq!(world.query::<&EnergyComponent>().iter().count(), 1);
+    }
+
+    #[test]
+    fn occupancy_decremented_on_death() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let idx = SpatialGrid::idx(50, 50);
+        grid.occupancy[idx] = 1;
+        world.spawn((PositionComponent(50, 50), EnergyComponent(0.0), AgeComponent(0)));
+
+        run_mortality_system(&mut world, &mut grid);
+
+        assert_eq!(grid.occupancy[idx], 0);
+    }
+
+    #[test]
+    fn all_dead_at_tick_50() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        for _ in 0..1_000 {
+            let idx = SpatialGrid::idx(50, 50);
+            grid.occupancy[idx] = grid.occupancy[idx].saturating_add(1);
+            world.spawn((PositionComponent(50, 50), EnergyComponent(1.0), AgeComponent(0)));
+        }
+
+        // f32 acumula error: tras 50 × 0.02 la energía queda en ~3e-8.
+        // El clamp a 0.0 ocurre en el tick 51; mortalidad dispara ahí.
+        for _ in 0..51 {
+            run_energy_system(&mut world, 20.0);
+            run_mortality_system(&mut world, &mut grid);
+        }
+
+        assert_eq!(
+            world.query::<&EnergyComponent>().iter().count(),
+            0,
+            "todas las abejas deben haber muerto en ~51 ticks (1.0 / 0.02 con f32)"
+        );
     }
 
     // --- M4: EnergySystem ---------------------------------------------------

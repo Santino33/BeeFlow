@@ -12,7 +12,11 @@ use crate::diffusion::DiffusionSystem;
 use crate::grid::{SpatialGrid, BORDER, GRID_W};
 use crate::metrics::{MetricsExporter, MetricsSnapshot};
 use crate::rng::RngSystem;
-use crate::systems::{run_age_system, run_energy_system, run_foraging_system, run_movement_system};
+use crate::metrics::MortalityBreakdown;
+use crate::systems::{
+    run_age_system, run_energy_system, run_foraging_system, run_mortality_system,
+    run_movement_system,
+};
 
 /// Motor de simulación. Controla el ciclo maestro de tick.
 pub struct Orchestrator {
@@ -24,6 +28,7 @@ pub struct Orchestrator {
     diffusion: DiffusionSystem,    // M2
     pub world: hecs::World,        // M3 — entidades ECS
     pub global_temp: f32,          // M4 — °C; actualizado por M10 (SystemDynamics)
+    deaths_by_energy: u32,         // M5 — acumulado entre exports; reset en cada snapshot
     metrics_dir: PathBuf,
 }
 
@@ -51,6 +56,7 @@ impl Orchestrator {
             diffusion: DiffusionSystem::new(),
             world,
             global_temp: 20.0,
+            deaths_by_energy: 0,
             metrics_dir,
         }
     }
@@ -74,6 +80,7 @@ impl Orchestrator {
             diffusion: DiffusionSystem::new(),
             world,
             global_temp: 20.0,
+            deaths_by_energy: 0,
             metrics_dir,
         }
     }
@@ -133,6 +140,8 @@ impl Orchestrator {
             run_age_system(&mut self.world);
             run_energy_system(&mut self.world, self.global_temp);   // M4
             run_foraging_system(&mut self.world, &mut self.grid);   // M4
+            self.deaths_by_energy +=
+                run_mortality_system(&mut self.world, &mut self.grid); // M5
         }
 
         // 6. Resolver interacciones Grid ↔ ECS (depositar feromonas, consumir recursos)
@@ -142,6 +151,7 @@ impl Orchestrator {
         if self.tick % 60 == 0 {
             let snapshot = self.build_snapshot();
             self.exporter.maybe_export(&snapshot);
+            self.deaths_by_energy = 0; // reset tras export
         }
 
         // 8. Enviar estado al renderer (mpsc, sin bloqueo)
@@ -151,11 +161,13 @@ impl Orchestrator {
         self.tick += 1;
     }
 
-    /// Construye el snapshot de métricas del estado actual.
-    /// En M0 todos los valores son 0/Default.
     fn build_snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             tick: self.tick,
+            mortality_rate: MortalityBreakdown {
+                by_energy: self.deaths_by_energy,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

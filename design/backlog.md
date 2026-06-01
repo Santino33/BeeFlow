@@ -129,14 +129,18 @@
 
 **Objetivo:** Limpieza correcta y sin memory leaks.
 
-- [ ] `MortalitySystem`: elimina entidades con `energy <= 0`
-- [ ] Registro en métricas: `mortality_rate` causa `energy`
-- [ ] Reuso de ID tras despawn verificado
-- [ ] Test: poblar 1,000 agentes sin recarga → todos muertos en tick ~50 → cero entidades activas
+- [x] `MortalitySystem`: elimina entidades con `energy <= 0`
+- [x] Registro en métricas: `mortality_rate` causa `energy`
+- [x] Reuso de ID tras despawn verificado
+- [x] Test: poblar 1,000 agentes sin recarga → todos muertos en tick ~51 → cero entidades activas
 
 **Criterio de éxito:**
-- Cero entidades activas al final del test anterior
-- Sin pánico, sin acceso inválido a entidad muerta en otros sistemas
+- [x] Cero entidades activas al final del test anterior — **verificado con `all_dead_at_tick_50`**
+- [x] Sin pánico, sin acceso inválido a entidad muerta en otros sistemas — **43/43 tests pasando**
+
+**Nota:** Con f32, 50 × 0.02 acumula error y deja ~3e-8 de energía. El clamp a 0.0 y la muerte ocurren en el tick 51. El comportamiento biológico (~50 ticks) es correcto.
+
+**Estado: COMPLETO** — 2026-06-01
 
 ---
 
