@@ -51,3 +51,10 @@ pub enum ForagerPhase {
 }
 
 pub struct ForagerStateComponent(pub ForagerPhase);
+
+/// Estado de transición de rol. Solo abejas transicionables (Nurse/Builder/Guard/Forager).
+/// Queen y Drone nunca tienen este componente — la ausencia es la restricción estructural.
+pub struct RoleTransitionState {
+    pub cooldown: u32,        // ticks restantes hasta próxima transición
+    pub threshold_bias: f32,  // factor ±10% del umbral base, fijo por agente desde seed
+}

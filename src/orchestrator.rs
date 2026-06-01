@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use crate::components::{
     AgeComponent, EnergyComponent, ForagerPhase, ForagerStateComponent, HealthComponent,
-    PheromoneSensitivity, PositionComponent, Role, RoleComponent, SirState,
+    PheromoneSensitivity, PositionComponent, Role, RoleComponent, RoleTransitionState, SirState,
 };
 use crate::config::RunConfig;
 use crate::diffusion::DiffusionSystem;
@@ -14,7 +14,7 @@ use crate::metrics::{MetricsExporter, MetricsSnapshot, MortalityBreakdown, RoleD
 use crate::rng::RngSystem;
 use crate::systems::{
     run_age_system, run_energy_system, run_foraging_system, run_mortality_system,
-    run_movement_system, run_resource_regeneration, METABOLIC_COST_BASAL,
+    run_movement_system, run_resource_regeneration, run_role_transition_system, METABOLIC_COST_BASAL,
 };
 
 /// Motor de simulación. Controla el ciclo maestro de tick.
@@ -156,6 +156,7 @@ impl Orchestrator {
             );
             self.deaths_by_energy +=
                 run_mortality_system(&mut self.world, &mut self.grid); // M5
+            run_role_transition_system(&mut self.world, &self.grid, &self.rng, self.tick); // M8
         }
 
         // 6. Resolver interacciones Grid ↔ ECS (depositar feromonas, consumir recursos)
@@ -228,6 +229,8 @@ fn spawn_initial_population(
 ) {
     use rand::Rng;
     let mut rng = rng_system.global_rng();
+    // RNG separado para biases de umbral: usa sentinel distinto para no perturbar secuencia de posiciones.
+    let mut bias_rng = rng_system.tick_rng(u64::MAX);
     let lo = BORDER;
     let hi = GRID_W - BORDER;
 
@@ -254,7 +257,7 @@ fn spawn_initial_population(
     let n_builders = n_rest *  9 / 100;
     let n_nurses   = n_rest - n_foragers - n_guards - n_builders;
 
-    // Nodrizas, Guardianas, Constructoras — sin ForagerStateComponent
+    // Nodrizas, Guardianas, Constructoras — con RoleTransitionState (M8)
     let non_forager_roles = [
         (Role::Nurse,   n_nurses,   PheromoneSensitivity([0.0, 1.0, 0.0])),
         (Role::Guard,   n_guards,   PheromoneSensitivity([1.0, 0.0, 0.0])),
@@ -266,6 +269,7 @@ fn spawn_initial_population(
             let y = rng.gen_range(lo..hi) as u16;
             let idx = SpatialGrid::idx(x as usize, y as usize);
             grid.occupancy[idx] = grid.occupancy[idx].saturating_add(1);
+            let bias: f32 = bias_rng.gen::<f32>() * 0.2 - 0.1;
             world.spawn((
                 PositionComponent(x, y),
                 RoleComponent(role),
@@ -273,16 +277,18 @@ fn spawn_initial_population(
                 HealthComponent(SirState::Susceptible),
                 AgeComponent(0),
                 sensitivity,
+                RoleTransitionState { cooldown: 0, threshold_bias: bias },
             ));
         }
     }
 
-    // Recolectoras — con ForagerStateComponent (M7)
+    // Recolectoras — con ForagerStateComponent (M7) y RoleTransitionState (M8)
     for _ in 0..n_foragers {
         let x = rng.gen_range(lo..hi) as u16;
         let y = rng.gen_range(lo..hi) as u16;
         let idx = SpatialGrid::idx(x as usize, y as usize);
         grid.occupancy[idx] = grid.occupancy[idx].saturating_add(1);
+        let bias: f32 = bias_rng.gen::<f32>() * 0.2 - 0.1;
         world.spawn((
             PositionComponent(x, y),
             RoleComponent(Role::Forager),
@@ -291,6 +297,7 @@ fn spawn_initial_population(
             AgeComponent(0),
             PheromoneSensitivity([0.0, 0.0, 1.0]),
             ForagerStateComponent(ForagerPhase::Searching),
+            RoleTransitionState { cooldown: 0, threshold_bias: bias },
         ));
     }
 }
@@ -477,6 +484,47 @@ mod tests {
             let a = std::fs::read(dir_a.path().join(filename)).unwrap();
             let b = std::fs::read(dir_b.path().join(filename)).unwrap();
             assert_eq!(a, b, "M7: archivo {filename} difiere entre runs con misma semilla");
+        }
+    }
+
+    // --- M8: RoleTransitionSystem -----------------------------------------------
+
+    #[test]
+    fn queen_role_unchanged_after_transitions() {
+        // Queen no tiene RoleTransitionState → su rol no cambia pese a feromonas.
+        // Se usa max_ticks=30 (dentro del ciclo de vida con energía inicial=0.8, costo=0.02/tick).
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 100,
+            max_ticks: Some(30),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        assert_eq!(
+            orch.world.query::<&RoleComponent>().iter().filter(|(_, r)| r.0 == Role::Queen).count(),
+            1
+        );
+        orch.run();
+        assert_eq!(
+            orch.world.query::<&RoleComponent>().iter().filter(|(_, r)| r.0 == Role::Queen).count(),
+            1,
+            "la reina no debe cambiar de rol por RoleTransitionSystem"
+        );
+    }
+
+    #[test]
+    fn determinism_preserved_with_m8() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        make_orchestrator(55, 121, &dir_a).run();
+        make_orchestrator(55, 121, &dir_b).run();
+
+        for filename in &["metrics_00000000.json", "metrics_00000060.json", "metrics_00000120.json"] {
+            let a = std::fs::read(dir_a.path().join(filename)).unwrap();
+            let b = std::fs::read(dir_b.path().join(filename)).unwrap();
+            assert_eq!(a, b, "M8: archivo {filename} difiere entre runs con misma semilla");
         }
     }
 

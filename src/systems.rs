@@ -1,8 +1,8 @@
 use rand::Rng;
 
 use crate::components::{
-    AgeComponent, EnergyComponent, ForagerPhase, ForagerStateComponent, PheromoneSensitivity,
-    PositionComponent, Role, RoleComponent,
+    AgeComponent, EnergyComponent, ForagerPhase, ForagerStateComponent, HealthComponent,
+    PheromoneSensitivity, PositionComponent, Role, RoleComponent, RoleTransitionState, SirState,
 };
 use crate::grid::{PheromoneKind, SpatialGrid, HIVE_X, HIVE_Y};
 use crate::rng::RngSystem;
@@ -236,6 +236,118 @@ pub fn run_resource_regeneration(
     for &(x, y) in food_sources {
         let idx = SpatialGrid::idx(x, y);
         grid.resource_amount[idx] = (grid.resource_amount[idx] + 0.001 * season_factor).min(1.0);
+    }
+}
+
+/// Umbral base del modelo Fixed-Threshold (Seeley 1995). simulation_spec.md §RoleTransition.
+pub const ROLE_TRANSITION_THRESHOLD_BASE: f32 = 0.5;
+
+/// Ticks mínimos entre transiciones de rol por agente.
+pub const ROLE_TRANSITION_COOLDOWN: u32 = 30;
+
+fn gaussian(x: f32, mean: f32, sigma: f32) -> f32 {
+    (-(x - mean).powi(2) / (2.0 * sigma.powi(2))).exp()
+}
+
+/// Factor de edad por rol candidato (simulation_spec.md §RoleTransition).
+fn age_factor(role: Role, age: u32) -> f32 {
+    let a = age as f32;
+    match role {
+        Role::Nurse   => (1.0 - a / 400.0).max(0.0),
+        Role::Builder => gaussian(a, 250.0, 100.0),
+        Role::Guard   => gaussian(a, 350.0, 100.0),
+        Role::Forager => (a / 400.0).min(1.0),
+        _             => 0.0,
+    }
+}
+
+/// Factor de salud para la probabilidad de transición.
+fn health_factor(state: SirState) -> f32 {
+    match state {
+        SirState::Susceptible => 1.0,
+        SirState::Infected    => 0.5,
+        SirState::Recovered   => 0.9,
+    }
+}
+
+/// Feromona que impulsa la transición hacia un rol candidato.
+fn candidate_pheromone(role: Role) -> PheromoneKind {
+    match role {
+        Role::Nurse | Role::Builder => PheromoneKind::Task,
+        Role::Guard                 => PheromoneKind::Alarm,
+        Role::Forager               => PheromoneKind::Attraction,
+        _                           => PheromoneKind::Task,
+    }
+}
+
+/// Evalúa el Fixed-Threshold Model y cambia roles según estímulos de feromona.
+///
+/// Fórmula: `P(→T) = s²/(s²+θ²)` donde `s = pheromone × age_factor × health_factor`.
+/// Solo abejas con `RoleTransitionState` son evaluadas (Queen/Drone no tienen ese componente).
+/// Al transicionar DESDE/HACIA Forager, gestiona `ForagerStateComponent` de forma coherente.
+pub fn run_role_transition_system(
+    world: &mut hecs::World,
+    grid: &SpatialGrid,
+    rng_system: &RngSystem,
+    tick: u64,
+) {
+    const CANDIDATES: [Role; 4] = [Role::Nurse, Role::Builder, Role::Guard, Role::Forager];
+
+    // Fase 1: evaluar transiciones y decrementar cooldowns.
+    // transition_data = (entity, new_role, from_forager, to_forager, threshold_bias)
+    let transition_data: Vec<(hecs::Entity, Role, bool, bool, f32)> = {
+        let mut out = Vec::new();
+        for (entity, (pos, role, age, health, ts)) in world.query_mut::<(
+            &PositionComponent,
+            &RoleComponent,
+            &AgeComponent,
+            &HealthComponent,
+            &mut RoleTransitionState,
+        )>() {
+            if ts.cooldown > 0 {
+                ts.cooldown -= 1;
+                continue;
+            }
+            let x = pos.0 as usize;
+            let y = pos.1 as usize;
+            let hf = health_factor(health.0);
+            let theta = ROLE_TRANSITION_THRESHOLD_BASE * (1.0 + ts.threshold_bias);
+            let bias = ts.threshold_bias;
+            let mut rng = rng_system.agent_rng_for_tick(entity.id() as u64, tick);
+            for &candidate in CANDIDATES.iter() {
+                if candidate == role.0 {
+                    continue;
+                }
+                let kind = candidate_pheromone(candidate);
+                let stimulus = grid.pheromone(x, y, kind) * age_factor(candidate, age.0) * hf;
+                let p = stimulus * stimulus / (stimulus * stimulus + theta * theta);
+                let r: f32 = rng.gen();
+                if r < p {
+                    out.push((entity, candidate, role.0 == Role::Forager, candidate == Role::Forager, bias));
+                    break;
+                }
+            }
+        }
+        out
+    };
+
+    // Fase 2: aplicar transiciones usando insert_one (reemplaza componentes existentes).
+    for (entity, new_role, from_forager, to_forager, bias) in transition_data {
+        if from_forager {
+            let _ = world.remove_one::<ForagerStateComponent>(entity);
+        }
+        if to_forager {
+            let _ = world.insert_one(entity, ForagerStateComponent(ForagerPhase::Searching));
+        }
+        let _ = world.insert_one(entity, RoleComponent(new_role));
+        let _ = world.insert_one(entity, RoleTransitionState { cooldown: ROLE_TRANSITION_COOLDOWN, threshold_bias: bias });
+        let new_sens = match new_role {
+            Role::Nurse | Role::Builder => [0.0, 1.0, 0.0],
+            Role::Guard                 => [1.0, 0.0, 0.0],
+            Role::Forager               => [0.0, 0.0, 1.0],
+            _                           => [0.0, 0.0, 0.0],
+        };
+        let _ = world.insert_one(entity, PheromoneSensitivity(new_sens));
     }
 }
 
@@ -782,6 +894,204 @@ mod tests {
 
         let res = grid.resource_amount[SpatialGrid::idx(20, 50)];
         assert!((res - 1.0).abs() < 1e-5, "recurso no debe superar 1.0");
+    }
+
+    // --- M8: RoleTransitionSystem -----------------------------------------------
+
+    fn make_transition_bee(x: u16, y: u16, role: Role, age: u32) -> (
+        PositionComponent,
+        RoleComponent,
+        EnergyComponent,
+        HealthComponent,
+        AgeComponent,
+        PheromoneSensitivity,
+        RoleTransitionState,
+    ) {
+        let sens = match role {
+            Role::Nurse | Role::Builder => PheromoneSensitivity([0.0, 1.0, 0.0]),
+            Role::Guard                 => PheromoneSensitivity([1.0, 0.0, 0.0]),
+            Role::Forager               => PheromoneSensitivity([0.0, 0.0, 1.0]),
+            _                           => PheromoneSensitivity([0.0, 0.0, 0.0]),
+        };
+        (
+            PositionComponent(x, y),
+            RoleComponent(role),
+            EnergyComponent(0.8),
+            HealthComponent(SirState::Susceptible),
+            AgeComponent(age),
+            sens,
+            RoleTransitionState { cooldown: 0, threshold_bias: 0.0 },
+        )
+    }
+
+    #[test]
+    fn queen_never_transitions() {
+        // Queen no tiene RoleTransitionState → no es queryeada → nunca transiciona.
+        let mut world = hecs::World::new();
+        let grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(50, 50),
+            RoleComponent(Role::Queen),
+            EnergyComponent(0.8),
+            HealthComponent(SirState::Susceptible),
+            AgeComponent(0),
+            PheromoneSensitivity([0.0, 0.0, 0.0]),
+        ));
+        run_role_transition_system(&mut world, &grid, &rng, 0);
+        for (_, role) in world.query::<&RoleComponent>().iter() {
+            assert_eq!(role.0, Role::Queen);
+        }
+    }
+
+    #[test]
+    fn drone_never_transitions() {
+        let mut world = hecs::World::new();
+        let grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(50, 50),
+            RoleComponent(Role::Drone),
+            EnergyComponent(0.8),
+            HealthComponent(SirState::Susceptible),
+            AgeComponent(0),
+            PheromoneSensitivity([0.0, 0.0, 0.0]),
+        ));
+        run_role_transition_system(&mut world, &grid, &rng, 0);
+        for (_, role) in world.query::<&RoleComponent>().iter() {
+            assert_eq!(role.0, Role::Drone);
+        }
+    }
+
+    #[test]
+    fn no_transition_without_pheromone() {
+        // Con stimulus = 0, P = 0 → sin transición.
+        let mut world = hecs::World::new();
+        let grid = SpatialGrid::new(); // pheromone = 0 en todo el grid
+        let rng = RngSystem::new(42);
+        world.spawn(make_transition_bee(50, 50, Role::Nurse, 200));
+        run_role_transition_system(&mut world, &grid, &rng, 0);
+        for (_, role) in world.query::<&RoleComponent>().iter() {
+            assert_eq!(role.0, Role::Nurse, "sin feromona no debe haber transición");
+        }
+    }
+
+    #[test]
+    fn cooldown_prevents_transition() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        // Feromona alta para que P ≈ 1 si no hubiera cooldown
+        grid.add_pheromone(50, 50, PheromoneKind::Attraction, 100.0);
+        grid.swap_pheromone_buffers();
+
+        world.spawn((
+            PositionComponent(50, 50),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            HealthComponent(SirState::Susceptible),
+            AgeComponent(400), // age_factor(Forager,400)=1.0
+            PheromoneSensitivity([0.0, 1.0, 0.0]),
+            RoleTransitionState { cooldown: 15, threshold_bias: 0.0 },
+        ));
+
+        run_role_transition_system(&mut world, &grid, &rng, 0);
+
+        // Rol no cambió
+        for (_, role) in world.query::<&RoleComponent>().iter() {
+            assert_eq!(role.0, Role::Nurse, "cooldown debe impedir la transición");
+        }
+        // Cooldown decrementó
+        for (_, ts) in world.query::<&RoleTransitionState>().iter() {
+            assert_eq!(ts.cooldown, 14, "cooldown debe decrementar en 1");
+        }
+    }
+
+    #[test]
+    fn transition_to_forager_adds_forager_state() {
+        // Nurse con feromona Attraction muy alta y age=400 → casi certeza de transición a Forager.
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        grid.add_pheromone(30, 30, PheromoneKind::Attraction, 1000.0);
+        grid.swap_pheromone_buffers();
+
+        world.spawn(make_transition_bee(30, 30, Role::Nurse, 400));
+
+        run_role_transition_system(&mut world, &grid, &rng, 0);
+
+        let roles: Vec<Role> = world.query::<&RoleComponent>().iter().map(|(_, r)| r.0).collect();
+        assert_eq!(roles, vec![Role::Forager], "debe haber transicionado a Forager");
+
+        let has_state = world.query::<&ForagerStateComponent>().iter().count() == 1;
+        assert!(has_state, "Forager recién transicionado debe tener ForagerStateComponent");
+    }
+
+    #[test]
+    fn transition_from_forager_removes_forager_state() {
+        // Forager con feromona Task alta y age=200 → transición a Nurse.
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        grid.add_pheromone(30, 30, PheromoneKind::Task, 1000.0);
+        grid.swap_pheromone_buffers();
+
+        world.spawn((
+            PositionComponent(30, 30),
+            RoleComponent(Role::Forager),
+            EnergyComponent(0.8),
+            HealthComponent(SirState::Susceptible),
+            AgeComponent(200),
+            PheromoneSensitivity([0.0, 0.0, 1.0]),
+            ForagerStateComponent(ForagerPhase::Searching),
+            RoleTransitionState { cooldown: 0, threshold_bias: 0.0 },
+        ));
+
+        run_role_transition_system(&mut world, &grid, &rng, 0);
+
+        // Debe haber transicionado a Nurse
+        for (_, role) in world.query::<&RoleComponent>().iter() {
+            assert_eq!(role.0, Role::Nurse, "Forager debe haber transicionado a Nurse");
+        }
+        // Ya no debe tener ForagerStateComponent
+        let still_has = world.query::<&ForagerStateComponent>().iter().count();
+        assert_eq!(still_has, 0, "ForagerStateComponent debe haberse eliminado al dejar de ser Forager");
+    }
+
+    #[test]
+    fn cooldown_set_after_transition() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        grid.add_pheromone(30, 30, PheromoneKind::Attraction, 1000.0);
+        grid.swap_pheromone_buffers();
+
+        world.spawn(make_transition_bee(30, 30, Role::Nurse, 400));
+
+        run_role_transition_system(&mut world, &grid, &rng, 0);
+
+        for (_, ts) in world.query::<&RoleTransitionState>().iter() {
+            assert_eq!(ts.cooldown, ROLE_TRANSITION_COOLDOWN, "cooldown debe ser 30 tras transición");
+        }
+    }
+
+    #[test]
+    fn age_factor_nurse_zero_at_max_age() {
+        assert!((age_factor(Role::Nurse, 400) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn age_factor_forager_one_at_max_age() {
+        assert!((age_factor(Role::Forager, 400) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn age_factor_forager_zero_at_birth() {
+        assert!((age_factor(Role::Forager, 0) - 0.0).abs() < 1e-6);
     }
 
     #[test]
