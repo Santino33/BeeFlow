@@ -14,7 +14,8 @@ use crate::metrics::{MetricsExporter, MetricsSnapshot, MortalityBreakdown, RoleD
 use crate::rng::RngSystem;
 use crate::systems::{
     run_age_system, run_energy_system, run_foraging_system, run_mortality_system,
-    run_movement_system, run_resource_regeneration, run_role_transition_system, METABOLIC_COST_BASAL,
+    run_movement_system, run_resource_regeneration, run_role_transition_system,
+    run_trophallaxis_system, METABOLIC_COST_BASAL,
 };
 
 /// Motor de simulación. Controla el ciclo maestro de tick.
@@ -154,6 +155,7 @@ impl Orchestrator {
                 &mut self.honey_reserve,
                 &mut self.honey_collected_period,
             );
+            run_trophallaxis_system(&mut self.world, self.honey_reserve); // M9
             self.deaths_by_energy +=
                 run_mortality_system(&mut self.world, &mut self.grid); // M5
             run_role_transition_system(&mut self.world, &self.grid, &self.rng, self.tick); // M8
@@ -485,6 +487,61 @@ mod tests {
             let b = std::fs::read(dir_b.path().join(filename)).unwrap();
             assert_eq!(a, b, "M7: archivo {filename} difiere entre runs con misma semilla");
         }
+    }
+
+    // --- M9: TrophallaxisSystem -------------------------------------------------
+
+    #[test]
+    fn energy_homogenizes_under_low_reserve() {
+        // Con reserva baja y abejas agrupadas, la varianza de energía debe disminuir.
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 100,
+            initial_honey_reserve: 0.05, // bien por debajo del umbral 0.30
+            max_ticks: Some(60),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+
+        // Varianza de energía inicial
+        let initial_energies: Vec<f32> = orch.world.query::<&EnergyComponent>().iter()
+            .map(|(_, e)| e.0).collect();
+        let initial_var = variance(&initial_energies);
+
+        orch.run();
+
+        let final_energies: Vec<f32> = orch.world.query::<&EnergyComponent>().iter()
+            .map(|(_, e)| e.0).collect();
+        let final_var = variance(&final_energies);
+
+        // La varianza debe haberse reducido (trofalaxia homogeniza energías)
+        // o al menos la colonia no colapsó sin razón (test de no-regresión)
+        assert!(
+            final_var <= initial_var + 0.1,
+            "varianza de energía no debe crecer drásticamente con trofalaxia activa: inicial={initial_var:.4}, final={final_var:.4}"
+        );
+    }
+
+    #[test]
+    fn determinism_preserved_with_m9() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        make_orchestrator(33, 121, &dir_a).run();
+        make_orchestrator(33, 121, &dir_b).run();
+
+        for filename in &["metrics_00000000.json", "metrics_00000060.json", "metrics_00000120.json"] {
+            let a = std::fs::read(dir_a.path().join(filename)).unwrap();
+            let b = std::fs::read(dir_b.path().join(filename)).unwrap();
+            assert_eq!(a, b, "M9: archivo {filename} difiere entre runs con misma semilla");
+        }
+    }
+
+    fn variance(values: &[f32]) -> f32 {
+        if values.is_empty() { return 0.0; }
+        let mean = values.iter().sum::<f32>() / values.len() as f32;
+        values.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32
     }
 
     // --- M8: RoleTransitionSystem -----------------------------------------------

@@ -239,6 +239,71 @@ pub fn run_resource_regeneration(
     }
 }
 
+/// Reserva de colonia por debajo de la cual se activa la trofalaxia (simulation_spec.md §Energy).
+pub const TROPHALLAXIS_RESERVE_THRESHOLD: f32 = 0.30;
+
+/// Energía transferida por tick entre un par adyacente durante trofalaxia.
+pub const TROPHALLAXIS_TRANSFER_RATE: f32 = 0.05;
+
+/// Redistribuye energía entre abejas adyacentes cuando la reserva de colonia está baja.
+///
+/// Activado solo cuando `honey_reserve < TROPHALLAXIS_RESERVE_THRESHOLD`.
+/// Por cada par en celdas adyacentes (Chebyshev ≤ 1): transfiere `TROPHALLAXIS_TRANSFER_RATE`
+/// de la abeja con más energía a la de menos. simulation_spec.md §Energy.
+pub fn run_trophallaxis_system(world: &mut hecs::World, honey_reserve: f32) {
+    use std::collections::HashMap;
+
+    if honey_reserve >= TROPHALLAXIS_RESERVE_THRESHOLD {
+        return;
+    }
+
+    // Paso 1: snapshot de posiciones y energías
+    let agents: Vec<(hecs::Entity, u16, u16, f32)> = world
+        .query::<(&PositionComponent, &EnergyComponent)>()
+        .iter()
+        .map(|(e, (pos, en))| (e, pos.0, pos.1, en.0))
+        .collect();
+
+    // Paso 2: calcular deltas para todos los pares adyacentes
+    let mut deltas: HashMap<hecs::Entity, f32> = HashMap::new();
+
+    for i in 0..agents.len() {
+        for j in (i + 1)..agents.len() {
+            let (e_i, x_i, y_i, en_i) = agents[i];
+            let (e_j, x_j, y_j, en_j) = agents[j];
+
+            let dx = (x_i as i32 - x_j as i32).unsigned_abs();
+            let dy = (y_i as i32 - y_j as i32).unsigned_abs();
+            if dx > 1 || dy > 1 {
+                continue; // Chebyshev > 1 → no adyacentes
+            }
+            if (en_i - en_j).abs() < 1e-6 {
+                continue; // misma energía → sin transferencia
+            }
+
+            let (donor, receiver, en_d, en_r) = if en_i >= en_j {
+                (e_i, e_j, en_i, en_j)
+            } else {
+                (e_j, e_i, en_j, en_i)
+            };
+
+            let transfer = TROPHALLAXIS_TRANSFER_RATE
+                .min(en_d - en_r) // no superar la diferencia
+                .min(en_d);       // donor no cae a negativo
+
+            *deltas.entry(donor).or_insert(0.0) -= transfer;
+            *deltas.entry(receiver).or_insert(0.0) += transfer;
+        }
+    }
+
+    // Paso 3: aplicar deltas
+    for (entity, (energy,)) in world.query_mut::<(&mut EnergyComponent,)>() {
+        if let Some(&delta) = deltas.get(&entity) {
+            energy.0 = (energy.0 + delta).clamp(0.0, 1.0);
+        }
+    }
+}
+
 /// Umbral base del modelo Fixed-Threshold (Seeley 1995). simulation_spec.md §RoleTransition.
 pub const ROLE_TRANSITION_THRESHOLD_BASE: f32 = 0.5;
 
@@ -894,6 +959,105 @@ mod tests {
 
         let res = grid.resource_amount[SpatialGrid::idx(20, 50)];
         assert!((res - 1.0).abs() < 1e-5, "recurso no debe superar 1.0");
+    }
+
+    // --- M9: TrophallaxisSystem -------------------------------------------------
+
+    #[test]
+    fn no_trophallaxis_above_threshold() {
+        let mut world = hecs::World::new();
+        world.spawn((PositionComponent(30, 30), EnergyComponent(0.8), AgeComponent(0)));
+        world.spawn((PositionComponent(31, 30), EnergyComponent(0.3), AgeComponent(0)));
+
+        run_trophallaxis_system(&mut world, 0.5); // reserve >= 0.30 → no-op
+
+        let energies: Vec<f32> = world.query::<&EnergyComponent>().iter()
+            .map(|(_, e)| e.0).collect();
+        assert!(energies.iter().any(|&e| (e - 0.8).abs() < 1e-5), "energía alta sin cambio");
+        assert!(energies.iter().any(|&e| (e - 0.3).abs() < 1e-5), "energía baja sin cambio");
+    }
+
+    #[test]
+    fn transfer_from_high_to_low_energy() {
+        let mut world = hecs::World::new();
+        let e_high = world.spawn((PositionComponent(30, 30), EnergyComponent(0.8), AgeComponent(0)));
+        let e_low  = world.spawn((PositionComponent(31, 30), EnergyComponent(0.3), AgeComponent(0)));
+
+        run_trophallaxis_system(&mut world, 0.1); // reserve < 0.30
+
+        let mut q_high = world.query_one::<&EnergyComponent>(e_high).unwrap();
+        let mut q_low  = world.query_one::<&EnergyComponent>(e_low).unwrap();
+        let high_after = q_high.get().unwrap().0;
+        let low_after  = q_low.get().unwrap().0;
+
+        assert!((high_after - 0.75).abs() < 1e-5, "donor debe perder 0.05, obtenido {high_after}");
+        assert!((low_after  - 0.35).abs() < 1e-5, "receptor debe ganar 0.05, obtenido {low_after}");
+    }
+
+    #[test]
+    fn same_cell_bees_exchange() {
+        let mut world = hecs::World::new();
+        let e_high = world.spawn((PositionComponent(30, 30), EnergyComponent(0.7), AgeComponent(0)));
+        let e_low  = world.spawn((PositionComponent(30, 30), EnergyComponent(0.2), AgeComponent(0)));
+
+        run_trophallaxis_system(&mut world, 0.1);
+
+        let mut q_high = world.query_one::<&EnergyComponent>(e_high).unwrap();
+        let mut q_low  = world.query_one::<&EnergyComponent>(e_low).unwrap();
+        assert!(q_high.get().unwrap().0 < 0.7, "abeja en misma celda con más energía debe perder");
+        assert!(q_low.get().unwrap().0  > 0.2, "abeja en misma celda con menos energía debe ganar");
+    }
+
+    #[test]
+    fn no_transfer_when_far_apart() {
+        let mut world = hecs::World::new();
+        world.spawn((PositionComponent(10, 10), EnergyComponent(0.9), AgeComponent(0)));
+        world.spawn((PositionComponent(30, 30), EnergyComponent(0.1), AgeComponent(0)));
+
+        run_trophallaxis_system(&mut world, 0.1);
+
+        let mut energies: Vec<f32> = world.query::<&EnergyComponent>().iter()
+            .map(|(_, e)| e.0).collect();
+        energies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((energies[0] - 0.1).abs() < 1e-5, "abeja lejana no debe ganar energía");
+        assert!((energies[1] - 0.9).abs() < 1e-5, "abeja lejana no debe perder energía");
+    }
+
+    #[test]
+    fn donor_energy_not_negative() {
+        let mut world = hecs::World::new();
+        let e_donor = world.spawn((PositionComponent(30, 30), EnergyComponent(0.03), AgeComponent(0)));
+        world.spawn((PositionComponent(31, 30), EnergyComponent(0.0), AgeComponent(0)));
+
+        run_trophallaxis_system(&mut world, 0.1);
+
+        let mut q = world.query_one::<&EnergyComponent>(e_donor).unwrap();
+        let after = q.get().unwrap().0;
+        assert!(after >= 0.0, "donor no debe tener energía negativa, obtenido {after}");
+    }
+
+    #[test]
+    fn no_transfer_equal_energy() {
+        let mut world = hecs::World::new();
+        world.spawn((PositionComponent(30, 30), EnergyComponent(0.5), AgeComponent(0)));
+        world.spawn((PositionComponent(31, 30), EnergyComponent(0.5), AgeComponent(0)));
+
+        run_trophallaxis_system(&mut world, 0.1);
+
+        for (_, en) in world.query::<&EnergyComponent>().iter() {
+            assert!((en.0 - 0.5).abs() < 1e-5, "abejas con igual energía no deben cambiar");
+        }
+    }
+
+    #[test]
+    fn single_bee_no_change() {
+        let mut world = hecs::World::new();
+        let entity = world.spawn((PositionComponent(30, 30), EnergyComponent(0.6), AgeComponent(0)));
+
+        run_trophallaxis_system(&mut world, 0.1);
+
+        let mut q = world.query_one::<&EnergyComponent>(entity).unwrap();
+        assert!((q.get().unwrap().0 - 0.6).abs() < 1e-5, "abeja sola no debe cambiar");
     }
 
     // --- M8: RoleTransitionSystem -----------------------------------------------
