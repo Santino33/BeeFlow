@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::config::RunConfig;
+use crate::diffusion::DiffusionSystem;
 use crate::grid::SpatialGrid;
 use crate::metrics::{MetricsExporter, MetricsSnapshot};
 use crate::rng::RngSystem;
@@ -18,7 +19,8 @@ pub struct Orchestrator {
     config: RunConfig,
     pub rng: RngSystem,
     exporter: MetricsExporter,
-    pub grid: SpatialGrid, // M1
+    pub grid: SpatialGrid,         // M1
+    diffusion: DiffusionSystem,    // M2
     metrics_dir: PathBuf,
 }
 
@@ -39,6 +41,7 @@ impl Orchestrator {
             rng,
             exporter,
             grid: SpatialGrid::new(),
+            diffusion: DiffusionSystem::new(),
             metrics_dir,
         }
     }
@@ -50,7 +53,15 @@ impl Orchestrator {
         let _ = std::fs::create_dir_all(&metrics_dir);
         let rng = RngSystem::new(config.seed);
         let exporter = MetricsExporter::new(&metrics_dir, 60);
-        Self { tick: 0, config, rng, exporter, grid: SpatialGrid::new(), metrics_dir }
+        Self {
+            tick: 0,
+            config,
+            rng,
+            exporter,
+            grid: SpatialGrid::new(),
+            diffusion: DiffusionSystem::new(),
+            metrics_dir,
+        }
     }
 
     /// Ejecuta el loop completo hasta `max_ticks` o hasta Ctrl-C.
@@ -95,7 +106,7 @@ impl Orchestrator {
         }
 
         // 3. Difundir feromonas en el Grid (double-buffer swap)
-        //    (M2: no-op)
+        self.diffusion.step(&mut self.grid);
 
         // 4. Regenerar recursos en celdas
         //    (M1/M10: no-op)
@@ -191,10 +202,12 @@ mod tests {
         }
         let avg_ns = t0.elapsed().as_nanos() / 1000;
 
-        // El tick vacío debe ser << 1ms (1_000_000 ns). Usamos 100_000 ns como margen holgado.
+        // Con difusión activa (M2), el tick ya no es vacío. En debug (sin optimizaciones)
+        // permitimos hasta 10 ms. La validación de rendimiento real está en el benchmark
+        // de release `cargo bench --bench diffusion` (objetivo: < 5 ms en 8 cores).
         assert!(
-            avg_ns < 100_000,
-            "tick_once promedio: {} ns (límite: 100_000 ns)",
+            avg_ns < 10_000_000,
+            "tick_once promedio: {} ns (límite: 10_000_000 ns)",
             avg_ns
         );
     }

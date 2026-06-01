@@ -33,3 +33,7 @@ harness = false
 [[bench]]
 name    = "grid_access"
 harness = false
+
+[[bench]]
+name    = "diffusion"
+harness = false

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod diffusion;
 pub mod grid;
 pub mod metrics;
 pub mod orchestrator;

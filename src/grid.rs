@@ -171,6 +171,26 @@ impl SpatialGrid {
         &mut self.phero[kind.index()][write_buf]
     }
 
+    /// Devuelve (read_slice, write_slice, is_obstacle) para el canal dado.
+    ///
+    /// # Safety
+    /// `read_buf != write_buf`, por lo que `phero[ch][rb]`, `phero[ch][wb]` e
+    /// `is_obstacle` son asignaciones de heap distintas sin aliasing.
+    pub fn channel_bufs_mut(&mut self, kind: PheromoneKind) -> (&[f32], &mut [f32], &[bool]) {
+        let ch = kind.index();
+        let rb = self.read_buf;
+        let wb = 1 - rb;
+        let read_ptr = self.phero[ch][rb].as_ptr();
+        let read_len = self.phero[ch][rb].len();
+        let obs_ptr = self.is_obstacle.as_ptr();
+        let obs_len = self.is_obstacle.len();
+        // SAFETY: Las tres Vecs tienen asignaciones de heap independientes.
+        let read = unsafe { std::slice::from_raw_parts(read_ptr, read_len) };
+        let obstacles = unsafe { std::slice::from_raw_parts(obs_ptr, obs_len) };
+        let write = &mut self.phero[ch][wb];
+        (read, write, obstacles)
+    }
+
     // -----------------------------------------------------------------------
     // Recursos y temperatura
     // -----------------------------------------------------------------------
