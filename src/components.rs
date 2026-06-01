@@ -41,3 +41,13 @@ pub struct AgeComponent(pub u32);
 /// Valor 1.0 = sensibilidad base; modulado por rol en M6.
 #[derive(Clone, Copy, Debug)]
 pub struct PheromoneSensitivity(pub [f32; 3]);
+
+/// Fase del ciclo de forrajeo. Solo Foragers tienen este componente.
+/// simulation_spec.md §Forrajeo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ForagerPhase {
+    Searching,
+    Returning { carry: f32 },
+}
+
+pub struct ForagerStateComponent(pub ForagerPhase);

@@ -4,17 +4,17 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::components::{
-    AgeComponent, EnergyComponent, HealthComponent, PheromoneSensitivity, PositionComponent,
-    Role, RoleComponent, SirState,
+    AgeComponent, EnergyComponent, ForagerPhase, ForagerStateComponent, HealthComponent,
+    PheromoneSensitivity, PositionComponent, Role, RoleComponent, SirState,
 };
 use crate::config::RunConfig;
 use crate::diffusion::DiffusionSystem;
-use crate::grid::{SpatialGrid, BORDER, GRID_W, HIVE_X, HIVE_Y};
+use crate::grid::{SpatialGrid, BORDER, FOOD_SOURCE_POSITIONS, GRID_W, HIVE_X, HIVE_Y};
 use crate::metrics::{MetricsExporter, MetricsSnapshot, MortalityBreakdown, RoleDistribution};
 use crate::rng::RngSystem;
 use crate::systems::{
     run_age_system, run_energy_system, run_foraging_system, run_mortality_system,
-    run_movement_system,
+    run_movement_system, run_resource_regeneration, METABOLIC_COST_BASAL,
 };
 
 /// Motor de simulación. Controla el ciclo maestro de tick.
@@ -23,18 +23,20 @@ pub struct Orchestrator {
     config: RunConfig,
     pub rng: RngSystem,
     exporter: MetricsExporter,
-    pub grid: SpatialGrid,         // M1
-    diffusion: DiffusionSystem,    // M2
-    pub world: hecs::World,        // M3 — entidades ECS
-    pub global_temp: f32,          // M4 — °C; actualizado por M10 (SystemDynamics)
-    deaths_by_energy: u32,         // M5 — acumulado entre exports; reset en cada snapshot
+    pub grid: SpatialGrid,              // M1
+    diffusion: DiffusionSystem,         // M2
+    pub world: hecs::World,             // M3 — entidades ECS
+    pub global_temp: f32,               // M4 — °C; actualizado por M10 (SystemDynamics)
+    deaths_by_energy: u32,             // M5 — acumulado entre exports; reset en cada snapshot
+    pub honey_reserve: f32,            // M7 — reserva global de miel
+    honey_collected_period: f32,       // M7 — miel depositada desde último export
+    food_sources: Vec<(usize, usize)>, // M7 — posiciones de fuentes de alimento
     metrics_dir: PathBuf,
 }
 
 impl Orchestrator {
     pub fn new(config: RunConfig) -> Self {
         let metrics_dir = PathBuf::from(".");
-        // Crear directorio de métricas si no existe
         let _ = std::fs::create_dir_all(&metrics_dir);
 
         let rng = RngSystem::new(config.seed);
@@ -46,8 +48,13 @@ impl Orchestrator {
         let mut world = hecs::World::new();
         spawn_initial_population(&mut world, &mut grid, &rng, config.initial_population);
 
+        let food_sources = init_food_sources(&mut grid);
+
         Self {
             tick: 0,
+            honey_reserve: config.initial_honey_reserve,
+            honey_collected_period: 0.0,
+            food_sources,
             config,
             rng,
             exporter,
@@ -70,8 +77,12 @@ impl Orchestrator {
         let mut grid = SpatialGrid::new();
         let mut world = hecs::World::new();
         spawn_initial_population(&mut world, &mut grid, &rng, config.initial_population);
+        let food_sources = init_food_sources(&mut grid);
         Self {
             tick: 0,
+            honey_reserve: config.initial_honey_reserve,
+            honey_collected_period: 0.0,
+            food_sources,
             config,
             rng,
             exporter,
@@ -128,16 +139,21 @@ impl Orchestrator {
         // 3. Difundir feromonas en el Grid (double-buffer swap)
         self.diffusion.step(&mut self.grid);
 
-        // 4. Regenerar recursos en celdas
-        //    (M1/M10: no-op)
+        // 4. Regenerar recursos en fuentes de alimento (M7)
+        run_resource_regeneration(&mut self.grid, &self.food_sources, 1.0);
 
         // 5. Ejecutar sistemas ECS en orden canónico
-        //    Orden: Movement → Energy → Foraging → Trophallaxis → Disease → Mortality → Role → Brood → Predator
+        //    Orden: Movement → Age → Energy → Foraging → Trophallaxis → Disease → Mortality → Role → Brood → Predator
         {
             run_movement_system(&mut self.world, &mut self.grid, &self.rng, self.tick);
             run_age_system(&mut self.world);
             run_energy_system(&mut self.world, self.global_temp);   // M4
-            run_foraging_system(&mut self.world, &mut self.grid);   // M4
+            run_foraging_system(                                      // M7
+                &mut self.world,
+                &mut self.grid,
+                &mut self.honey_reserve,
+                &mut self.honey_collected_period,
+            );
             self.deaths_by_energy +=
                 run_mortality_system(&mut self.world, &mut self.grid); // M5
         }
@@ -149,7 +165,8 @@ impl Orchestrator {
         if self.tick % 60 == 0 {
             let snapshot = self.build_snapshot();
             self.exporter.maybe_export(&snapshot);
-            self.deaths_by_energy = 0; // reset tras export
+            self.deaths_by_energy = 0;
+            self.honey_collected_period = 0.0;
         }
 
         // 8. Enviar estado al renderer (mpsc, sin bloqueo)
@@ -171,9 +188,19 @@ impl Orchestrator {
                 Role::Drone   => by_role.drone   += 1,
             }
         }
+        // foraging_efficiency = miel_depositada / (n_foragers × ticks × costo_basal)
+        // ticks entre exports = 60; costo energético es proxy del gasto de los foragers
+        let foraging_efficiency = if by_role.forager > 0 {
+            self.honey_collected_period
+                / (by_role.forager as f32 * 60.0 * METABOLIC_COST_BASAL)
+        } else {
+            0.0
+        };
         MetricsSnapshot {
             tick: self.tick,
             population_by_role: by_role,
+            colony_reserve: self.honey_reserve,
+            foraging_efficiency,
             mortality_rate: MortalityBreakdown {
                 by_energy: self.deaths_by_energy,
                 ..Default::default()
@@ -227,14 +254,13 @@ fn spawn_initial_population(
     let n_builders = n_rest *  9 / 100;
     let n_nurses   = n_rest - n_foragers - n_guards - n_builders;
 
-    let roles = [
+    // Nodrizas, Guardianas, Constructoras — sin ForagerStateComponent
+    let non_forager_roles = [
         (Role::Nurse,   n_nurses,   PheromoneSensitivity([0.0, 1.0, 0.0])),
-        (Role::Forager, n_foragers, PheromoneSensitivity([0.0, 0.0, 1.0])),
         (Role::Guard,   n_guards,   PheromoneSensitivity([1.0, 0.0, 0.0])),
         (Role::Builder, n_builders, PheromoneSensitivity([0.0, 1.0, 0.0])),
     ];
-
-    for (role, c, sensitivity) in roles {
+    for (role, c, sensitivity) in non_forager_roles {
         for _ in 0..c {
             let x = rng.gen_range(lo..hi) as u16;
             let y = rng.gen_range(lo..hi) as u16;
@@ -250,6 +276,46 @@ fn spawn_initial_population(
             ));
         }
     }
+
+    // Recolectoras — con ForagerStateComponent (M7)
+    for _ in 0..n_foragers {
+        let x = rng.gen_range(lo..hi) as u16;
+        let y = rng.gen_range(lo..hi) as u16;
+        let idx = SpatialGrid::idx(x as usize, y as usize);
+        grid.occupancy[idx] = grid.occupancy[idx].saturating_add(1);
+        world.spawn((
+            PositionComponent(x, y),
+            RoleComponent(Role::Forager),
+            EnergyComponent(0.8),
+            HealthComponent(SirState::Susceptible),
+            AgeComponent(0),
+            PheromoneSensitivity([0.0, 0.0, 1.0]),
+            ForagerStateComponent(ForagerPhase::Searching),
+        ));
+    }
+}
+
+/// Radio de cada parche de alimento en celdas. Parches 17×17 (~10% del grid interior).
+/// Con este radio, ~10 Foragers inician DENTRO de los parches con seed=42, 500 pop.
+const FOOD_SOURCE_RADIUS: i32 = 8;
+
+/// Inicializa las fuentes de alimento como parches cuadrados alrededor de cada posición central.
+/// Devuelve todas las posiciones de celda con recurso (para regeneración por tick).
+fn init_food_sources(grid: &mut SpatialGrid) -> Vec<(usize, usize)> {
+    let mut sources = Vec::new();
+    for &(cx, cy) in FOOD_SOURCE_POSITIONS.iter() {
+        for dy in -FOOD_SOURCE_RADIUS..=FOOD_SOURCE_RADIUS {
+            for dx in -FOOD_SOURCE_RADIUS..=FOOD_SOURCE_RADIUS {
+                let x = (cx as i32 + dx) as usize;
+                let y = (cy as i32 + dy) as usize;
+                if SpatialGrid::in_bounds(x, y) && !grid.is_obstacle[SpatialGrid::idx(x, y)] {
+                    grid.set_resource(x, y, 1.0);
+                    sources.push((x, y));
+                }
+            }
+        }
+    }
+    sources
 }
 
 #[cfg(test)]
@@ -318,6 +384,100 @@ mod tests {
             "tick_once promedio: {} ns (límite: {} ns)",
             avg_ns, limit_ns
         );
+    }
+
+    // --- M7: Sistema de Forrajeo ------------------------------------------------
+
+    #[test]
+    fn food_sources_initialized() {
+        use crate::grid::FOOD_SOURCE_POSITIONS;
+        let dir = TempDir::new().unwrap();
+        let orch = make_orchestrator(42, 0, &dir);
+
+        // Verificar que los centros de las 3 fuentes tienen recurso 1.0
+        for &(x, y) in FOOD_SOURCE_POSITIONS.iter() {
+            let res = orch.grid.resource(x, y);
+            assert!(
+                (res - 1.0).abs() < 1e-5,
+                "Centro de fuente ({x},{y}) debe tener resource_amount=1.0, obtenido {res}"
+            );
+        }
+        // Verificar que al menos un vecino del centro también tiene recurso (parche 3×3)
+        let (cx, cy) = FOOD_SOURCE_POSITIONS[0];
+        let neighbor_res = orch.grid.resource(cx + 1, cy);
+        assert!(neighbor_res > 0.0, "El parche 3×3 debe extenderse a ({}, {})", cx + 1, cy);
+    }
+
+    #[test]
+    fn honey_reserve_initialized_from_config() {
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_honey_reserve: 0.5,
+            max_ticks: Some(0),
+            ..Default::default()
+        };
+        let orch = Orchestrator::new_with_output(config, dir.path());
+        assert!((orch.honey_reserve - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn honey_reserve_grows_with_foragers() {
+        // Criterio del backlog: 3 fuentes + ~100 recolectoras → honey_reserve crece.
+        // Usamos población 500 (default, ~100 foragers) y 600 ticks.
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 500,
+            initial_honey_reserve: 0.0,
+            max_ticks: Some(600),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        let initial = orch.honey_reserve;
+        orch.run();
+        assert!(
+            orch.honey_reserve > initial,
+            "honey_reserve debe crecer con ~100 foragers y 3 fuentes: inicial={initial}, final={}",
+            orch.honey_reserve
+        );
+    }
+
+    #[test]
+    fn foraging_efficiency_positive_in_snapshot() {
+        // Criterio del backlog: foraging_efficiency > 0 y coherente.
+        // Se verifica en el export del tick 60, que captura depósitos de ticks 1-60.
+        // Los foragers (0.02/tick) viven ~40 ticks; deben encontrar y depositar dentro de ese plazo.
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 500,
+            initial_honey_reserve: 0.0,
+            max_ticks: Some(61), // tick 60 export + stop
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        orch.run();
+
+        let content = std::fs::read_to_string(dir.path().join("metrics_00000060.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let eff = parsed["foraging_efficiency"].as_f64().unwrap_or(0.0);
+        assert!(eff > 0.0, "foraging_efficiency debe ser > 0 en tick 60, obtenido {eff}");
+    }
+
+    #[test]
+    fn determinism_preserved_with_m7() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        make_orchestrator(77, 121, &dir_a).run();
+        make_orchestrator(77, 121, &dir_b).run();
+
+        for filename in &["metrics_00000000.json", "metrics_00000060.json", "metrics_00000120.json"] {
+            let a = std::fs::read(dir_a.path().join(filename)).unwrap();
+            let b = std::fs::read(dir_b.path().join(filename)).unwrap();
+            assert_eq!(a, b, "M7: archivo {filename} difiere entre runs con misma semilla");
+        }
     }
 
     // --- M6: Roles diferenciados ------------------------------------------------

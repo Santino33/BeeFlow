@@ -16,6 +16,9 @@ pub const PHEROMONE_CHANNELS: usize = 3;
 pub const HIVE_X: usize = 50;
 pub const HIVE_Y: usize = 50;
 
+/// Posiciones fijas de las 3 fuentes de alimento (simulation_spec.md §Recursos).
+pub const FOOD_SOURCE_POSITIONS: [(usize, usize); 3] = [(20, 50), (80, 50), (50, 20)];
+
 /// Tipos de feromona. Los índices coinciden con simulation_spec.md §Feromonas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PheromoneKind {
