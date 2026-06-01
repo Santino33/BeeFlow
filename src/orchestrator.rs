@@ -135,8 +135,7 @@ impl Orchestrator {
         // 5. Ejecutar sistemas ECS en orden canónico
         //    Orden: Movement → Energy → Foraging → Trophallaxis → Disease → Mortality → Role → Brood → Predator
         {
-            let mut tick_rng = self.rng.tick_rng(self.tick);
-            run_movement_system(&mut self.world, &mut self.grid, &mut tick_rng);
+            run_movement_system(&mut self.world, &mut self.grid, &self.rng, self.tick);
             run_age_system(&mut self.world);
             run_energy_system(&mut self.world, self.global_temp);   // M4
             run_foraging_system(&mut self.world, &mut self.grid);   // M4
@@ -261,13 +260,18 @@ mod tests {
         }
         let avg_ns = t0.elapsed().as_nanos() / 1000;
 
-        // Con difusión activa (M2), el tick ya no es vacío. En debug (sin optimizaciones)
-        // permitimos hasta 10 ms. La validación de rendimiento real está en el benchmark
-        // de release `cargo bench --bench diffusion` (objetivo: < 5 ms en 8 cores).
+        // En debug (sin optimizaciones) permitimos hasta 10 ms.
+        // En release el límite real es 2 ms — detecta regresiones O(N²) con N=500.
+        // La validación de rendimiento en release está en `cargo bench --bench diffusion`.
+        #[cfg(debug_assertions)]
+        let limit_ns: u128 = 10_000_000;
+        #[cfg(not(debug_assertions))]
+        let limit_ns: u128 = 2_000_000;
+
         assert!(
-            avg_ns < 10_000_000,
-            "tick_once promedio: {} ns (límite: 10_000_000 ns)",
-            avg_ns
+            avg_ns < limit_ns,
+            "tick_once promedio: {} ns (límite: {} ns)",
+            avg_ns, limit_ns
         );
     }
 }

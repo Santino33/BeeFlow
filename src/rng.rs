@@ -39,6 +39,16 @@ impl RngSystem {
         )
     }
 
+    /// RNG determinista para un agente en un tick específico.
+    /// Combina seed global + agent_id + tick para independencia total entre agentes y ticks,
+    /// incluso si el orden de iteración de hecs cambia tras despawns.
+    pub fn agent_rng_for_tick(&self, agent_id: u64, tick: u64) -> Xoshiro256StarStar {
+        let derived = self.global_seed
+            .wrapping_add(agent_id.wrapping_mul(SEED_MULTIPLIER))
+            .wrapping_add(tick.wrapping_mul(SEED_MULTIPLIER.wrapping_add(1)));
+        Xoshiro256StarStar::seed_from_u64(derived)
+    }
+
     pub fn global_seed(&self) -> u64 {
         self.global_seed
     }
@@ -82,5 +92,16 @@ mod tests {
         let mut a = sys.tick_rng(0);
         let mut b = sys.tick_rng(1);
         assert_ne!(a.next_u64(), b.next_u64());
+    }
+
+    #[test]
+    fn agent_rng_for_tick_differs_per_agent_and_tick() {
+        let sys = RngSystem::new(42);
+        let mut a = sys.agent_rng_for_tick(1, 0);
+        let mut b = sys.agent_rng_for_tick(2, 0);
+        let mut c = sys.agent_rng_for_tick(1, 1);
+        assert_ne!(a.next_u64(), b.next_u64(), "agentes distintos deben divergir");
+        let mut a2 = sys.agent_rng_for_tick(1, 0);
+        assert_ne!(a2.next_u64(), c.next_u64(), "mismo agente, ticks distintos deben divergir");
     }
 }

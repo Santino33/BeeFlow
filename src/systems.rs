@@ -1,20 +1,21 @@
 use rand::Rng;
-use rand_xoshiro::Xoshiro256StarStar;
 
 use crate::components::{AgeComponent, EnergyComponent, PositionComponent, Role, RoleComponent};
 use crate::grid::SpatialGrid;
+use crate::rng::RngSystem;
 
 /// Costo metabólico basal por tick (simulation_spec.md §Energía).
 pub const METABOLIC_COST_BASAL: f32 = 0.02;
 
 /// Paseo aleatorio: cada abeja se mueve a uno de sus 8 vecinos no-obstacle.
-/// Usa `rng` para elegir dirección (derivado de tick en el Orchestrator).
+/// Usa un RNG derivado por (entity_id, tick) para determinismo estable incluso tras despawns.
 pub fn run_movement_system(
     world: &mut hecs::World,
     grid: &mut SpatialGrid,
-    rng: &mut Xoshiro256StarStar,
+    rng_system: &RngSystem,
+    tick: u64,
 ) {
-    for (_, pos) in world.query_mut::<&mut PositionComponent>() {
+    for (entity, pos) in world.query_mut::<&mut PositionComponent>() {
         let x = pos.0 as usize;
         let y = pos.1 as usize;
 
@@ -30,11 +31,13 @@ pub fn run_movement_system(
             continue;
         }
 
-        let (nx, ny) = valid[rng.gen_range(0..valid.len())];
+        let mut agent_rng = rng_system.agent_rng_for_tick(entity.id() as u64, tick);
+        let (nx, ny) = valid[agent_rng.gen_range(0..valid.len())];
 
         let oi = SpatialGrid::idx(x, y);
         let ni = SpatialGrid::idx(nx, ny);
-        grid.occupancy[oi] = grid.occupancy[oi].saturating_sub(1);
+        debug_assert!(grid.occupancy[oi] > 0, "occupancy underflow en ({x},{y})");
+        grid.occupancy[oi] -= 1;
         grid.occupancy[ni] = grid.occupancy[ni].saturating_add(1);
 
         pos.0 = nx as u16;
@@ -74,7 +77,8 @@ pub fn run_mortality_system(world: &mut hecs::World, grid: &mut SpatialGrid) -> 
     let count = dead.len() as u32;
     for (entity, pos) in dead {
         let idx = SpatialGrid::idx(pos.0 as usize, pos.1 as usize);
-        grid.occupancy[idx] = grid.occupancy[idx].saturating_sub(1);
+        debug_assert!(grid.occupancy[idx] > 0, "occupancy underflow en muerte ({},{})", pos.0, pos.1);
+        grid.occupancy[idx] -= 1;
         let _ = world.despawn(entity);
     }
     count
@@ -106,11 +110,10 @@ pub fn run_foraging_system(world: &mut hecs::World, grid: &mut SpatialGrid) {
 
 #[cfg(test)]
 mod tests {
-    use rand_xoshiro::rand_core::SeedableRng;
-
     use super::*;
     use crate::components::*;
     use crate::grid::SpatialGrid;
+    use crate::rng::RngSystem;
 
     fn make_bee(x: u16, y: u16) -> (
         PositionComponent,
@@ -168,12 +171,12 @@ mod tests {
     fn movement_updates_position() {
         let mut world = hecs::World::new();
         let mut grid = SpatialGrid::new();
-        let mut rng = Xoshiro256StarStar::seed_from_u64(42);
+        let rng_system = RngSystem::new(42);
 
         let entity = world.spawn(make_bee(50, 50));
         grid.occupancy[SpatialGrid::idx(50, 50)] = 1;
 
-        run_movement_system(&mut world, &mut grid, &mut rng);
+        run_movement_system(&mut world, &mut grid, &rng_system, 0);
 
         let mut q = world.query_one::<&PositionComponent>(entity).unwrap();
         let pos = q.get().unwrap();
@@ -379,5 +382,66 @@ mod tests {
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
             assert!((energy.0 - 0.5).abs() < 1e-6, "la nodriza no debe ganar energía");
         }
+    }
+
+    // --- H1: occupancy como contador estricto ----------------------------------
+
+    #[test]
+    fn occupancy_conservation_with_multiple_agents() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng_system = RngSystem::new(42);
+
+        // 3 agentes co-ubicados en (50,50)
+        for _ in 0..3 {
+            grid.occupancy[SpatialGrid::idx(50, 50)] += 1;
+            world.spawn(make_bee(50, 50));
+        }
+
+        run_movement_system(&mut world, &mut grid, &rng_system, 0);
+
+        // La suma total de ocupación debe conservarse: los 3 agentes se movieron,
+        // pero cada uno sigue ocupando exactamente 1 celda
+        let total: u64 = grid.occupancy.iter().sum();
+        assert_eq!(total, 3, "la suma de occupancy debe ser 3 tras el movimiento");
+    }
+
+    // --- H2: determinismo post-despawn -----------------------------------------
+
+    #[test]
+    fn movement_deterministic_after_despawn() {
+        let rng_system = RngSystem::new(99);
+
+        // Función auxiliar: spawn 3 abejas, despawn la primera, mover en tick 1
+        let run = || {
+            let mut world = hecs::World::new();
+            let mut grid = SpatialGrid::new();
+            let mut entities = Vec::new();
+            for i in 0..3u16 {
+                grid.occupancy[SpatialGrid::idx(50, (50 + i) as usize)] += 1;
+                entities.push(world.spawn(make_bee(50, 50 + i)));
+            }
+            // Despawn del primer agente (simula muerte en tick 0)
+            let idx0 = SpatialGrid::idx(50, 50);
+            debug_assert!(grid.occupancy[idx0] > 0);
+            grid.occupancy[idx0] -= 1;
+            world.despawn(entities[0]).unwrap();
+
+            // Movimiento en tick 1 con los 2 agentes restantes
+            run_movement_system(&mut world, &mut grid, &rng_system, 1);
+
+            // Recoger posiciones de los supervivientes por entity id
+            let mut positions: Vec<(u32, u16, u16)> = world
+                .query::<&PositionComponent>()
+                .iter()
+                .map(|(e, p)| (e.id(), p.0, p.1))
+                .collect();
+            positions.sort_by_key(|&(id, _, _)| id);
+            positions
+        };
+
+        let a = run();
+        let b = run();
+        assert_eq!(a, b, "posiciones deben ser idénticas en dos runs con misma seed tras despawn");
     }
 }
