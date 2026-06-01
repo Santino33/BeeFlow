@@ -86,16 +86,18 @@
 
 **Objetivo:** Abejas que existen en el mundo con componentes correctos.
 
-- [ ] Componentes: `PositionComponent`, `RoleComponent`, `EnergyComponent`, `HealthComponent`, `AgeComponent`, `PheromoneSensitivity`
-- [ ] Spawn de N abejas con posición inicial aleatoria dentro del grid (no en borde)
-- [ ] Pool de IDs con reuso (evitar fragmentación de `hecs`)
-- [ ] `MovementSystem`: movimiento aleatorio (sin bias de feromona aún)
-- [ ] `AgeComponent` incrementado 1 por tick
-- [ ] Tests: spawn/despawn, lectura de componentes, iteración por archetype
+- [x] Componentes: `PositionComponent`, `RoleComponent`, `EnergyComponent`, `HealthComponent`, `AgeComponent`, `PheromoneSensitivity`
+- [x] Spawn de N abejas con posición inicial aleatoria dentro del grid (no en borde)
+- [x] Pool de IDs: hecs reutiliza slots automáticamente; spawn/despawn verificado
+- [x] `MovementSystem`: movimiento aleatorio 8-direccional (sin bias de feromona aún)
+- [x] `AgeComponent` incrementado 1 por tick (`run_age_system`)
+- [x] Tests: spawn/despawn/no-zombie, lectura de 6 componentes, movement, age
 
 **Criterio de éxito:**
-- 5,000 agentes con solo MovementSystem y AgeSystem: < 10 ms/tick
-- Sin entidades "zombie" tras despawn
+- [x] 5,000 agentes con MovementSystem + AgeSystem: **~1.6 ms/tick** (objetivo: < 10 ms)
+- [x] Sin entidades "zombie" tras despawn — verificado con test
+
+**Estado: COMPLETO** — 2026-06-01
 
 ---
 

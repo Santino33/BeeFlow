@@ -31,6 +31,14 @@ impl RngSystem {
         Xoshiro256StarStar::seed_from_u64(derived)
     }
 
+    /// RNG determinista para un tick dado. La semilla varía con cada tick,
+    /// produciendo movimientos distintos cada vez sin mutar el estado global.
+    pub fn tick_rng(&self, tick: u64) -> Xoshiro256StarStar {
+        Xoshiro256StarStar::seed_from_u64(
+            self.global_seed.wrapping_add(tick.wrapping_mul(SEED_MULTIPLIER)),
+        )
+    }
+
     pub fn global_seed(&self) -> u64 {
         self.global_seed
     }
@@ -65,6 +73,14 @@ mod tests {
         let sys_b = RngSystem::new(2);
         let mut a = sys_a.agent_rng(0);
         let mut b = sys_b.agent_rng(0);
+        assert_ne!(a.next_u64(), b.next_u64());
+    }
+
+    #[test]
+    fn tick_rng_differs_per_tick() {
+        let sys = RngSystem::new(42);
+        let mut a = sys.tick_rng(0);
+        let mut b = sys.tick_rng(1);
         assert_ne!(a.next_u64(), b.next_u64());
     }
 }

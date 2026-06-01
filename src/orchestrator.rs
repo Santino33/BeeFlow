@@ -3,17 +3,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
+use crate::components::{
+    AgeComponent, EnergyComponent, HealthComponent, PheromoneSensitivity, PositionComponent,
+    Role, RoleComponent, SirState,
+};
 use crate::config::RunConfig;
 use crate::diffusion::DiffusionSystem;
-use crate::grid::SpatialGrid;
+use crate::grid::{SpatialGrid, BORDER, GRID_W};
 use crate::metrics::{MetricsExporter, MetricsSnapshot};
 use crate::rng::RngSystem;
+use crate::systems::{run_age_system, run_movement_system};
 
 /// Motor de simulación. Controla el ciclo maestro de tick.
-///
-/// Estructura diseñada para recibir los módulos posteriores:
-/// - M3: hecs World (agentes ECS)
-/// - M10: SystemDynamicsState (variables globales)
 pub struct Orchestrator {
     tick: u64,
     config: RunConfig,
@@ -21,6 +22,7 @@ pub struct Orchestrator {
     exporter: MetricsExporter,
     pub grid: SpatialGrid,         // M1
     diffusion: DiffusionSystem,    // M2
+    pub world: hecs::World,        // M3 — entidades ECS
     metrics_dir: PathBuf,
 }
 
@@ -35,13 +37,18 @@ impl Orchestrator {
 
         info!(seed = config.seed, speed = config.simulation_speed, "Orchestrator inicializado");
 
+        let mut grid = SpatialGrid::new();
+        let mut world = hecs::World::new();
+        spawn_initial_population(&mut world, &mut grid, &rng, config.initial_population);
+
         Self {
             tick: 0,
             config,
             rng,
             exporter,
-            grid: SpatialGrid::new(),
+            grid,
             diffusion: DiffusionSystem::new(),
+            world,
             metrics_dir,
         }
     }
@@ -53,13 +60,17 @@ impl Orchestrator {
         let _ = std::fs::create_dir_all(&metrics_dir);
         let rng = RngSystem::new(config.seed);
         let exporter = MetricsExporter::new(&metrics_dir, 60);
+        let mut grid = SpatialGrid::new();
+        let mut world = hecs::World::new();
+        spawn_initial_population(&mut world, &mut grid, &rng, config.initial_population);
         Self {
             tick: 0,
             config,
             rng,
             exporter,
-            grid: SpatialGrid::new(),
+            grid,
             diffusion: DiffusionSystem::new(),
+            world,
             metrics_dir,
         }
     }
@@ -111,9 +122,13 @@ impl Orchestrator {
         // 4. Regenerar recursos en celdas
         //    (M1/M10: no-op)
 
-        // 5. Ejecutar sistemas ECS en orden canónico (rayon)
+        // 5. Ejecutar sistemas ECS en orden canónico
         //    Orden: Movement → Energy → Foraging → Trophallaxis → Disease → Mortality → Role → Brood → Predator
-        //    (M3+: no-op)
+        {
+            let mut tick_rng = self.rng.tick_rng(self.tick);
+            run_movement_system(&mut self.world, &mut self.grid, &mut tick_rng);
+            run_age_system(&mut self.world);
+        }
 
         // 6. Resolver interacciones Grid ↔ ECS (depositar feromonas, consumir recursos)
         //    (M3+: no-op)
@@ -146,6 +161,33 @@ impl Orchestrator {
 
     pub fn metrics_dir(&self) -> &PathBuf {
         &self.metrics_dir
+    }
+}
+
+/// Pobla el mundo con `count` abejas en posiciones interiores aleatorias.
+fn spawn_initial_population(
+    world: &mut hecs::World,
+    grid: &mut SpatialGrid,
+    rng_system: &RngSystem,
+    count: u32,
+) {
+    use rand::Rng;
+    let mut rng = rng_system.global_rng();
+    let lo = BORDER;
+    let hi = GRID_W - BORDER;
+    for _ in 0..count {
+        let x = rng.gen_range(lo..hi) as u16;
+        let y = rng.gen_range(lo..hi) as u16;
+        let idx = SpatialGrid::idx(x as usize, y as usize);
+        grid.occupancy[idx] = grid.occupancy[idx].saturating_add(1);
+        world.spawn((
+            PositionComponent(x, y),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            HealthComponent(SirState::Susceptible),
+            AgeComponent(0),
+            PheromoneSensitivity([1.0, 1.0, 1.0]),
+        ));
     }
 }
 

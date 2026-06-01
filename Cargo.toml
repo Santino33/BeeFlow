@@ -37,3 +37,7 @@ harness = false
 [[bench]]
 name    = "diffusion"
 harness = false
+
+[[bench]]
+name    = "ecs_tick"
+harness = false
