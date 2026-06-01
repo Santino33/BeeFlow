@@ -152,15 +152,17 @@
 
 **Objetivo:** Cada rol tiene comportamiento distinto y costos propios.
 
-- [ ] Spawn inicial con distribución de roles: 1 reina, 60% nodrizas, 20% recolectoras, 10% guardianas, 9% constructoras, ~0% zánganos
-- [ ] Costo energético específico por rol (ver `simulation_spec.md`)
-- [ ] `MovementSystem` con bias por gradiente de feromona según `PheromoneSensitivity` y rol
-- [ ] Reinas no se mueven (posición fija en colmena)
-- [ ] Zánganos se mueven aleatoriamente sin tarea
+- [x] Spawn inicial con distribución de roles: 1 reina, 60% nodrizas, 20% recolectoras, 10% guardianas, 9% constructoras, ~0% zánganos
+- [x] Costo energético específico por rol (Drone: 0.025/tick; resto: 0.02/tick)
+- [x] `MovementSystem` con bias por gradiente de feromona según `PheromoneSensitivity` y rol
+- [x] Reinas no se mueven (posición fija en colmena)
+- [x] Zánganos se mueven aleatoriamente sin tarea
 
 **Criterio de éxito:**
-- Distribución de roles estable bajo parámetros default
-- Reina siempre en posición de colmena
+- [x] Distribución de roles estable bajo parámetros default — **51/51 tests pasando**
+- [x] Reina siempre en posición de colmena — **verificado con `queen_at_hive_position` y `queen_skips_movement`**
+
+**Estado: COMPLETO** — 2026-06-01
 
 ---
 

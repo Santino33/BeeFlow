@@ -12,6 +12,9 @@ pub const CHUNKS_Y: usize = 7;
 pub const BORDER: usize = 5;
 pub const TOTAL_CELLS: usize = GRID_W * GRID_H;
 pub const PHEROMONE_CHANNELS: usize = 3;
+/// Posición de la colmena en el grid (simulation_spec.md §Grid: hive_position).
+pub const HIVE_X: usize = 50;
+pub const HIVE_Y: usize = 50;
 
 /// Tipos de feromona. Los índices coinciden con simulation_spec.md §Feromonas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
