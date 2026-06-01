@@ -109,15 +109,17 @@
 
 **Objetivo:** Metabolismo individual conforme a `simulation_spec.md`.
 
-- [ ] `EnergySystem`: aplica `metabolic_cost_basal = 0.02/tick` a toda abeja
-- [ ] Modulación por temperatura global: `cost *= (1 + 0.01 * (temp - 20))`
-- [ ] `ForagingSystem` (versión básica): recolectora en celda con recurso gana energía
-- [ ] Ganancia = `resource_amount * 2.0`, clampeada a `1.0`
-- [ ] `resource_amount` decrece al ser consumido
+- [x] `EnergySystem`: aplica `metabolic_cost_basal = 0.02/tick` a toda abeja
+- [x] Modulación por temperatura global: `cost *= (1 + 0.01 * (temp - 20))`
+- [x] `ForagingSystem` (versión básica): recolectora en celda con recurso gana energía
+- [x] Ganancia = `resource_amount * 2.0`, clampeada a `1.0`
+- [x] `resource_amount` decrece al ser consumido
 
 **Criterio de éxito:**
-- Sin energía recargada, una abeja vive exactamente `1.0 / 0.02 = 50 ticks`
-- El perfil de mortalidad sin recarga es una curva determinista con la semilla fija
+- [x] Sin energía recargada, una abeja vive exactamente `1.0 / 0.02 = 50 ticks` — **verificado con test `energy_reaches_zero_at_tick_50`**
+- [x] El perfil de mortalidad sin recarga es una curva determinista con la semilla fija — **`same_seed_produces_identical_metrics` sigue pasando**
+
+**Estado: COMPLETO** — 2026-06-01
 
 ---
 

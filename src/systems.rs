@@ -1,8 +1,11 @@
 use rand::Rng;
 use rand_xoshiro::Xoshiro256StarStar;
 
-use crate::components::{AgeComponent, PositionComponent};
+use crate::components::{AgeComponent, EnergyComponent, PositionComponent, Role, RoleComponent};
 use crate::grid::SpatialGrid;
+
+/// Costo metabólico basal por tick (simulation_spec.md §Energía).
+pub const METABOLIC_COST_BASAL: f32 = 0.02;
 
 /// Paseo aleatorio: cada abeja se mueve a uno de sus 8 vecinos no-obstacle.
 /// Usa `rng` para elegir dirección (derivado de tick en el Orchestrator).
@@ -43,6 +46,37 @@ pub fn run_movement_system(
 pub fn run_age_system(world: &mut hecs::World) {
     for (_, age) in world.query_mut::<&mut AgeComponent>() {
         age.0 += 1;
+    }
+}
+
+/// Aplica el costo metabólico basal a todas las abejas, modulado por temperatura.
+/// Fórmula: cost = METABOLIC_COST_BASAL × (1 + 0.01 × (global_temp − 20)).
+/// La energía se clampea a 0.0; la muerte la gestiona MortalitySystem (M5).
+pub fn run_energy_system(world: &mut hecs::World, global_temp: f32) {
+    let temp_factor = 1.0 + 0.01 * (global_temp - 20.0);
+    for (_, energy) in world.query_mut::<&mut EnergyComponent>() {
+        let cost = METABOLIC_COST_BASAL * temp_factor;
+        energy.0 = (energy.0 - cost).max(0.0);
+    }
+}
+
+/// Forager en celda con recurso gana energía; el recurso decrece proporcionalmente.
+/// Ganancia = resource_amount × 2.0, clampeada para no superar 1.0 de energía.
+pub fn run_foraging_system(world: &mut hecs::World, grid: &mut SpatialGrid) {
+    for (_, (pos, role, energy)) in
+        world.query_mut::<(&PositionComponent, &RoleComponent, &mut EnergyComponent)>()
+    {
+        if role.0 != Role::Forager {
+            continue;
+        }
+        let idx = SpatialGrid::idx(pos.0 as usize, pos.1 as usize);
+        let res = grid.resource_amount[idx];
+        if res <= 0.0 {
+            continue;
+        }
+        let gain = (res * 2.0).min(1.0 - energy.0);
+        energy.0 += gain;
+        grid.resource_amount[idx] = (res - gain / 2.0).max(0.0);
     }
 }
 
@@ -140,6 +174,126 @@ mod tests {
 
         for (_, age) in world.query::<&AgeComponent>().iter() {
             assert_eq!(age.0, 3);
+        }
+    }
+
+    // --- M4: EnergySystem ---------------------------------------------------
+
+    #[test]
+    fn energy_decreases_by_basal_cost() {
+        let mut world = hecs::World::new();
+        world.spawn(make_bee(50, 50)); // energy = 0.8
+
+        run_energy_system(&mut world, 20.0);
+
+        for (_, energy) in world.query::<&EnergyComponent>().iter() {
+            assert!(
+                (energy.0 - 0.78).abs() < 1e-5,
+                "energy esperada 0.78, obtenida {}",
+                energy.0
+            );
+        }
+    }
+
+    #[test]
+    fn energy_clamped_at_zero() {
+        let mut world = hecs::World::new();
+        world.spawn((EnergyComponent(0.01), AgeComponent(0)));
+
+        run_energy_system(&mut world, 20.0); // costaría 0.02 → sin clamp quedaría negativo
+
+        for (_, energy) in world.query::<&EnergyComponent>().iter() {
+            assert!(energy.0 >= 0.0, "energy no debe ser negativa");
+        }
+    }
+
+    #[test]
+    fn energy_reaches_zero_at_tick_50() {
+        let mut world = hecs::World::new();
+        world.spawn((EnergyComponent(1.0), AgeComponent(0)));
+
+        for _ in 0..50 {
+            run_energy_system(&mut world, 20.0);
+        }
+
+        for (_, energy) in world.query::<&EnergyComponent>().iter() {
+            assert!(
+                energy.0 < 1e-5,
+                "energy debe ser ~0 tras 50 ticks, obtenida {}",
+                energy.0
+            );
+        }
+    }
+
+    #[test]
+    fn temp_modulates_cost() {
+        let mut world = hecs::World::new();
+        world.spawn((EnergyComponent(1.0), AgeComponent(0)));
+
+        run_energy_system(&mut world, 30.0); // factor = 1 + 0.01*10 = 1.1 → cost = 0.022
+
+        for (_, energy) in world.query::<&EnergyComponent>().iter() {
+            let expected = 1.0 - 0.022_f32;
+            assert!(
+                (energy.0 - expected).abs() < 1e-5,
+                "a 30°C energy esperada {}, obtenida {}",
+                expected,
+                energy.0
+            );
+        }
+    }
+
+    // --- M4: ForagingSystem -------------------------------------------------
+
+    #[test]
+    fn forager_gains_energy_from_resource() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+
+        let x = 50usize;
+        let y = 50usize;
+        grid.resource_amount[SpatialGrid::idx(x, y)] = 0.5;
+
+        world.spawn((
+            PositionComponent(x as u16, y as u16),
+            RoleComponent(Role::Forager),
+            EnergyComponent(0.0),
+            AgeComponent(0),
+        ));
+
+        run_foraging_system(&mut world, &mut grid);
+
+        let remaining_res = grid.resource_amount[SpatialGrid::idx(x, y)];
+        assert!(remaining_res < 0.5, "el recurso debe haber disminuido");
+
+        for (_, energy) in world.query::<&EnergyComponent>().iter() {
+            assert!(energy.0 > 0.0, "la recolectora debe haber ganado energía");
+        }
+    }
+
+    #[test]
+    fn non_forager_ignores_resource() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+
+        let x = 50usize;
+        let y = 50usize;
+        grid.resource_amount[SpatialGrid::idx(x, y)] = 0.5;
+
+        world.spawn((
+            PositionComponent(x as u16, y as u16),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.5),
+            AgeComponent(0),
+        ));
+
+        run_foraging_system(&mut world, &mut grid);
+
+        let res = grid.resource_amount[SpatialGrid::idx(x, y)];
+        assert!((res - 0.5).abs() < 1e-6, "el recurso no debe cambiar");
+
+        for (_, energy) in world.query::<&EnergyComponent>().iter() {
+            assert!((energy.0 - 0.5).abs() < 1e-6, "la nodriza no debe ganar energía");
         }
     }
 }

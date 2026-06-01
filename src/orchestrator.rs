@@ -12,7 +12,7 @@ use crate::diffusion::DiffusionSystem;
 use crate::grid::{SpatialGrid, BORDER, GRID_W};
 use crate::metrics::{MetricsExporter, MetricsSnapshot};
 use crate::rng::RngSystem;
-use crate::systems::{run_age_system, run_movement_system};
+use crate::systems::{run_age_system, run_energy_system, run_foraging_system, run_movement_system};
 
 /// Motor de simulación. Controla el ciclo maestro de tick.
 pub struct Orchestrator {
@@ -23,6 +23,7 @@ pub struct Orchestrator {
     pub grid: SpatialGrid,         // M1
     diffusion: DiffusionSystem,    // M2
     pub world: hecs::World,        // M3 — entidades ECS
+    pub global_temp: f32,          // M4 — °C; actualizado por M10 (SystemDynamics)
     metrics_dir: PathBuf,
 }
 
@@ -49,6 +50,7 @@ impl Orchestrator {
             grid,
             diffusion: DiffusionSystem::new(),
             world,
+            global_temp: 20.0,
             metrics_dir,
         }
     }
@@ -71,6 +73,7 @@ impl Orchestrator {
             grid,
             diffusion: DiffusionSystem::new(),
             world,
+            global_temp: 20.0,
             metrics_dir,
         }
     }
@@ -128,6 +131,8 @@ impl Orchestrator {
             let mut tick_rng = self.rng.tick_rng(self.tick);
             run_movement_system(&mut self.world, &mut self.grid, &mut tick_rng);
             run_age_system(&mut self.world);
+            run_energy_system(&mut self.world, self.global_temp);   // M4
+            run_foraging_system(&mut self.world, &mut self.grid);   // M4
         }
 
         // 6. Resolver interacciones Grid ↔ ECS (depositar feromonas, consumir recursos)
