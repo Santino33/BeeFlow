@@ -1,20 +1,21 @@
 use rand::Rng;
 
 use crate::components::{
-    AgeComponent, EnergyComponent, ForagerPhase, ForagerStateComponent, HealthComponent,
-    PheromoneSensitivity, PositionComponent, Role, RoleComponent, RoleTransitionState, SirState,
+    AgeComponent, BroodStage, BroodStageComponent, EnergyComponent, ForagerPhase,
+    ForagerStateComponent, HealthComponent, PheromoneSensitivity, PositionComponent,
+    PredatorComponent, Role, RoleComponent, RoleTransitionState, SirState,
 };
 use crate::grid::{PheromoneKind, SpatialGrid, HIVE_X, HIVE_Y};
 use crate::rng::RngSystem;
 
 /// Costo metabólico basal por tick (simulation_spec.md §Energía).
-pub const METABOLIC_COST_BASAL: f32 = 0.02;
+pub const METABOLIC_COST_BASAL: f32 = 0.008;
 
 /// Máxima carga de néctar que puede llevar un Forager (simulation_spec.md §Forrajeo).
 pub const FORAGER_CARRY_MAX: f32 = 0.5;
 
 /// Radio Manhattan al que un Forager deposita su carga en la colmena.
-pub const HIVE_DEPOSIT_RADIUS: u32 = 3;
+pub const HIVE_DEPOSIT_RADIUS: u32 = 8;
 
 /// Tasa de emisión de feromona de atracción al recolectar (simulation_spec.md §Feromonas).
 pub const FORAGER_PHEROMONE_EMISSION: f32 = 0.15;
@@ -37,8 +38,8 @@ pub fn run_movement_system(
         Option<&PheromoneSensitivity>,
         Option<&ForagerStateComponent>,
     )>() {
-        // Reina no se mueve
-        if role.map(|r| r.0 == Role::Queen).unwrap_or(false) {
+        // Reina no se mueve; entidades sin rol (cría pasiva) tampoco.
+        if role.map_or(true, |r| r.0 == Role::Queen) {
             continue;
         }
 
@@ -136,13 +137,18 @@ pub fn run_age_system(world: &mut hecs::World) {
     }
 }
 
-/// Aplica el costo metabólico a todas las abejas, modulado por temperatura y rol.
+/// Aplica el costo metabólico a todas las abejas, modulado por temperatura, rol y enfermedad.
 /// Drone: 0.025/tick (simulation_spec.md §Roles). Resto: METABOLIC_COST_BASAL.
 /// Foragers reciben drain adicional de `0.001 × pesticide_pressure` por pesticidas (M10).
+/// Infected: ×DISEASE_ENERGY_MULTIPLIER sobre el costo total (M12).
 /// La energía se clampea a 0.0; la muerte la gestiona MortalitySystem (M5).
 pub fn run_energy_system(world: &mut hecs::World, global_temp: f32, pesticide_pressure: f32) {
     let temp_factor = 1.0 + 0.01 * (global_temp - 20.0);
-    for (_, (energy, role)) in world.query_mut::<(&mut EnergyComponent, Option<&RoleComponent>)>() {
+    for (_, (energy, role, health)) in world.query_mut::<(
+        &mut EnergyComponent,
+        Option<&RoleComponent>,
+        Option<&HealthComponent>,
+    )>() {
         let base_cost = match role.map(|r| r.0) {
             Some(Role::Drone) => 0.025,
             _                 => METABOLIC_COST_BASAL,
@@ -152,29 +158,41 @@ pub fn run_energy_system(world: &mut hecs::World, global_temp: f32, pesticide_pr
         } else {
             0.0
         };
-        energy.0 = (energy.0 - (base_cost + extra_cost) * temp_factor).max(0.0);
+        let disease_factor = if health.map(|h| h.state == SirState::Infected).unwrap_or(false) {
+            DISEASE_ENERGY_MULTIPLIER
+        } else {
+            1.0
+        };
+        energy.0 = (energy.0 - (base_cost + extra_cost) * temp_factor * disease_factor).max(0.0);
     }
 }
 
 /// Elimina entidades con energía ≤ 0. Decrementa ocupación del grid.
-/// Devuelve el número de muertes (causa: energía) para las métricas.
-pub fn run_mortality_system(world: &mut hecs::World, grid: &mut SpatialGrid) -> u32 {
-    let dead: Vec<(hecs::Entity, PositionComponent)> = world
-        .query::<(&EnergyComponent, &PositionComponent)>()
+/// Devuelve `(deaths_by_energy, deaths_by_disease)`: Infected que mueren se cuentan como disease.
+pub fn run_mortality_system(world: &mut hecs::World, grid: &mut SpatialGrid) -> (u32, u32) {
+    let dead: Vec<(hecs::Entity, PositionComponent, bool)> = world
+        .query::<(&EnergyComponent, &PositionComponent, Option<&HealthComponent>)>()
         .iter()
-        .filter_map(|(e, (energy, pos))| {
-            if energy.0 <= 0.0 { Some((e, *pos)) } else { None }
+        .filter_map(|(e, (energy, pos, health))| {
+            if energy.0 <= 0.0 {
+                let is_disease = health.map(|h| h.state == SirState::Infected).unwrap_or(false);
+                Some((e, *pos, is_disease))
+            } else {
+                None
+            }
         })
         .collect();
 
-    let count = dead.len() as u32;
-    for (entity, pos) in dead {
+    let mut by_energy = 0u32;
+    let mut by_disease = 0u32;
+    for (entity, pos, is_disease) in dead {
         let idx = SpatialGrid::idx(pos.0 as usize, pos.1 as usize);
         debug_assert!(grid.occupancy[idx] > 0, "occupancy underflow en muerte ({},{})", pos.0, pos.1);
         grid.occupancy[idx] -= 1;
         let _ = world.despawn(entity);
+        if is_disease { by_disease += 1; } else { by_energy += 1; }
     }
-    count
+    (by_energy, by_disease)
 }
 
 /// Ciclo completo de forrajeo (M7). simulation_spec.md §Forrajeo y §Energía.
@@ -191,11 +209,12 @@ pub fn run_foraging_system(
     honey_reserve: &mut f32,
     honey_collected: &mut f32,
 ) {
-    for (_, (pos, role, energy, state)) in world.query_mut::<(
+    for (_, (pos, role, energy, state, health)) in world.query_mut::<(
         &PositionComponent,
         &RoleComponent,
         &mut EnergyComponent,
         &mut ForagerStateComponent,
+        Option<&HealthComponent>,
     )>() {
         if role.0 != Role::Forager {
             continue;
@@ -209,8 +228,14 @@ pub fn run_foraging_system(
             ForagerPhase::Searching => {
                 let res = grid.resource_amount[idx];
                 if res > 0.0 {
-                    // Ganancia personal (spec §Energía: resource × 2.0, clampeada a 1.0)
-                    let gain = (res * 2.0).min(1.0 - energy.0);
+                    // Infected Forager gana menos energía (simulation_spec.md §Disease).
+                    let efficiency = if health.map(|h| h.state == SirState::Infected).unwrap_or(false) {
+                        DISEASE_FORAGING_EFFICIENCY
+                    } else {
+                        1.0
+                    };
+                    // Ganancia personal (spec §Energía: resource × 2.0 × efficiency, clampeada).
+                    let gain = (res * 2.0 * efficiency).min(1.0 - energy.0);
                     energy.0 += gain;
                     let personal_consumed = gain / 2.0;
                     // Carry: recurso adicional para la colmena
@@ -246,7 +271,7 @@ pub fn run_resource_regeneration(
 }
 
 /// Reserva de colonia por debajo de la cual se activa la trofalaxia (simulation_spec.md §Energy).
-pub const TROPHALLAXIS_RESERVE_THRESHOLD: f32 = 0.30;
+pub const TROPHALLAXIS_RESERVE_THRESHOLD: f32 = 0.70;
 
 /// Energía transferida por tick entre un par adyacente durante trofalaxia.
 pub const TROPHALLAXIS_TRANSFER_RATE: f32 = 0.05;
@@ -381,7 +406,7 @@ pub fn run_role_transition_system(
             }
             let x = pos.0 as usize;
             let y = pos.1 as usize;
-            let hf = health_factor(health.0);
+            let hf = health_factor(health.state);
             let theta = ROLE_TRANSITION_THRESHOLD_BASE * (1.0 + ts.threshold_bias);
             let bias = ts.threshold_bias;
             let mut rng = rng_system.agent_rng_for_tick(entity.id() as u64, tick);
@@ -423,6 +448,454 @@ pub fn run_role_transition_system(
 }
 
 // ---------------------------------------------------------------------------
+// M12: DiseaseSystem (SIR)
+// ---------------------------------------------------------------------------
+
+/// Duración del estado Infected antes de pasar a Recovered. simulation_spec.md §Disease.
+pub const DISEASE_INFECTION_DURATION: u32 = 200;
+/// Duración del estado Recovered antes de volver a Susceptible.
+pub const DISEASE_RECOVERY_DURATION: u32 = 300;
+/// Factor multiplicativo de costo metabólico para Infected (+20%).
+pub const DISEASE_ENERGY_MULTIPLIER: f32 = 1.20;
+/// Factor de eficiencia de forrajeo para Infected (-30%).
+pub const DISEASE_FORAGING_EFFICIENCY: f32 = 0.70;
+/// Susceptibilidad reducida para abejas jóvenes (age < 100).
+pub const DISEASE_YOUNG_SUSCEPTIBILITY: f32 = 0.8;
+
+/// Transmisión SIR y progresión de la enfermedad. simulation_spec.md §Sistema Epidemiológico.
+///
+/// Fórmula: `P(S→I) = base_rate × contact_density × susceptibility`
+/// donde `contact_density` = nº de Infected en celda propia + 8 celdas adyacentes (Chebyshev ≤ 1).
+/// No-op si `enabled=false`.
+pub fn run_disease_system(
+    world: &mut hecs::World,
+    rng_system: &RngSystem,
+    tick: u64,
+    base_rate: f32,
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+
+    use crate::grid::{GRID_H, GRID_W};
+
+    // Fase 1 — Mapa de Infected por celda
+    let mut infected_per_cell = vec![0u32; GRID_W * GRID_H];
+    for (_, (pos, health)) in world
+        .query::<(&PositionComponent, &HealthComponent)>()
+        .iter()
+    {
+        if health.state == SirState::Infected {
+            infected_per_cell[SpatialGrid::idx(pos.0 as usize, pos.1 as usize)] += 1;
+        }
+    }
+
+    // Fase 2 — Densidad de contacto (Chebyshev ≤ 1) para cada celda
+    let mut contact_density = vec![0u32; GRID_W * GRID_H];
+    for y in 0..GRID_H {
+        for x in 0..GRID_W {
+            let mut sum = 0u32;
+            for nx in x.saturating_sub(1)..=(x + 1).min(GRID_W - 1) {
+                for ny in y.saturating_sub(1)..=(y + 1).min(GRID_H - 1) {
+                    sum += infected_per_cell[SpatialGrid::idx(nx, ny)];
+                }
+            }
+            contact_density[SpatialGrid::idx(x, y)] = sum;
+        }
+    }
+
+    // Fase 3 — Evaluar transiciones (query inmutable → Vec)
+    let mut to_infect:      Vec<hecs::Entity> = Vec::new();
+    let mut to_recover:     Vec<hecs::Entity> = Vec::new();
+    let mut to_susceptible: Vec<hecs::Entity> = Vec::new();
+
+    for (entity, (pos, health, age)) in world
+        .query::<(&PositionComponent, &HealthComponent, &AgeComponent)>()
+        .iter()
+    {
+        match health.state {
+            SirState::Susceptible => {
+                let cd = contact_density[SpatialGrid::idx(pos.0 as usize, pos.1 as usize)] as f32;
+                if cd == 0.0 {
+                    continue;
+                }
+                let susceptibility = if age.0 < 100 { DISEASE_YOUNG_SUSCEPTIBILITY } else { 1.0 };
+                let p = base_rate * cd * susceptibility;
+                let mut rng = rng_system.agent_rng_for_tick(entity.id() as u64, tick);
+                if rng.gen::<f32>() < p {
+                    to_infect.push(entity);
+                }
+            }
+            SirState::Infected => {
+                if health.ticks_in_state >= DISEASE_INFECTION_DURATION {
+                    to_recover.push(entity);
+                }
+            }
+            SirState::Recovered => {
+                if health.ticks_in_state >= DISEASE_RECOVERY_DURATION {
+                    to_susceptible.push(entity);
+                }
+            }
+        }
+    }
+
+    // Fase 3b — Aplicar transiciones
+    for entity in to_infect {
+        let _ = world.insert_one(entity, HealthComponent { state: SirState::Infected, ticks_in_state: 0 });
+    }
+    for entity in to_recover {
+        let _ = world.insert_one(entity, HealthComponent { state: SirState::Recovered, ticks_in_state: 0 });
+    }
+    for entity in to_susceptible {
+        let _ = world.insert_one(entity, HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 });
+    }
+
+    // Fase 4 — Avanzar timers de Infected y Recovered
+    for (_, health) in world.query_mut::<&mut HealthComponent>() {
+        if health.state != SirState::Susceptible {
+            health.ticks_in_state += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M11: BroodSystem
+// ---------------------------------------------------------------------------
+
+/// Umbral de edad (ticks desde oviposición) para cada transición de etapa.
+pub const BROOD_EGG_END: u32   = 36;
+pub const BROOD_LARVA_END: u32 = 36 + 144; // 180
+pub const BROOD_PUPA_END: u32  = 36 + 144 + 120; // 300
+
+/// Pérdida de salud virtual por tick cuando no hay Nurse adyacente. simulation_spec.md §Cría.
+pub const BROOD_HEALTH_DRAIN: f32 = 0.01;
+
+/// Feromona Task emitida por cada larva por tick.
+pub const BROOD_TASK_EMISSION: f32 = 0.1;
+
+/// Ciclo de cría completo: oviposición, transiciones de etapa, feromona, muerte y eclosión.
+///
+/// - Fase 1: Queen pone huevo con probabilidad `brood_production_rate` (si > 0).
+/// - Fase 2: Snapshot de posiciones de Nurses para chequeo de adyacencia.
+/// - Fase 3: Transiciones Egg→Larva→Pupa, drain de salud virtual sin Nurse, emisión de feromona Task.
+/// - Fase 4: Despawn larvas muertas; eclosión de pupas completas como Bee Nurse.
+pub fn run_brood_system(
+    world: &mut hecs::World,
+    grid: &mut SpatialGrid,
+    rng_system: &RngSystem,
+    tick: u64,
+    brood_production_rate: f32,
+) {
+    // Fase 1 — Queen pone huevo
+    if brood_production_rate > 0.0 {
+        let queen_pos: Option<(u16, u16)> = world
+            .query::<(&RoleComponent, &PositionComponent)>()
+            .iter()
+            .find_map(|(_, (r, p))| {
+                if r.0 == Role::Queen { Some((p.0, p.1)) } else { None }
+            });
+
+        if let Some((qx, qy)) = queen_pos {
+            let mut rng = rng_system.tick_rng(tick);
+            if rng.gen::<f32>() < brood_production_rate {
+                world.spawn((
+                    PositionComponent(qx, qy),
+                    AgeComponent(0),
+                    BroodStageComponent(BroodStage::Egg),
+                ));
+            }
+        }
+    }
+
+    // Fase 2 — Snapshot de posiciones de Nurses
+    use std::collections::HashSet;
+    let nurse_positions: HashSet<(u16, u16)> = world
+        .query::<(&RoleComponent, &PositionComponent)>()
+        .iter()
+        .filter_map(|(_, (r, p))| {
+            if r.0 == Role::Nurse { Some((p.0, p.1)) } else { None }
+        })
+        .collect();
+
+    // Fase 3 — Transiciones, feromona, drain de salud
+    for (_, (age, stage, pos)) in world.query_mut::<(
+        &AgeComponent,
+        &mut BroodStageComponent,
+        &PositionComponent,
+    )>() {
+        let x = pos.0 as usize;
+        let y = pos.1 as usize;
+        let a = age.0;
+
+        match stage.0 {
+            BroodStage::Egg => {
+                if a >= BROOD_EGG_END {
+                    stage.0 = BroodStage::Larva { health_virtual: 1.0 };
+                }
+            }
+            BroodStage::Larva { ref mut health_virtual } => {
+                grid.add_pheromone(x, y, PheromoneKind::Task, BROOD_TASK_EMISSION);
+
+                let has_nurse = chebyshev_adjacent(pos.0, pos.1, &nurse_positions);
+                if !has_nurse {
+                    *health_virtual -= BROOD_HEALTH_DRAIN;
+                }
+
+                if a >= BROOD_LARVA_END {
+                    stage.0 = BroodStage::Pupa;
+                }
+            }
+            BroodStage::Pupa => {}
+        }
+    }
+
+    // Fase 4 — Recoger despawns y eclosiones
+    let dead_larvae: Vec<hecs::Entity> = world
+        .query::<&BroodStageComponent>()
+        .iter()
+        .filter_map(|(e, s)| {
+            if matches!(s.0, BroodStage::Larva { health_virtual } if health_virtual <= 0.0) {
+                Some(e)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let ready_eclose: Vec<(hecs::Entity, u16, u16)> = world
+        .query::<(&BroodStageComponent, &AgeComponent, &PositionComponent)>()
+        .iter()
+        .filter_map(|(e, (s, age, pos))| {
+            if s.0 == BroodStage::Pupa && age.0 >= BROOD_PUPA_END {
+                Some((e, pos.0, pos.1))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for entity in dead_larvae {
+        let _ = world.despawn(entity);
+    }
+
+    for (entity, ex, ey) in ready_eclose {
+        let bias: f32 = rng_system
+            .agent_rng_for_tick(entity.id() as u64, tick)
+            .gen::<f32>()
+            * 0.2
+            - 0.1;
+        let _ = world.despawn(entity);
+        world.spawn((
+            PositionComponent(ex, ey),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
+            AgeComponent(0),
+            PheromoneSensitivity([0.0, 1.0, 0.0]),
+            RoleTransitionState { cooldown: 0, threshold_bias: bias },
+        ));
+        let idx = SpatialGrid::idx(ex as usize, ey as usize);
+        grid.occupancy[idx] = grid.occupancy[idx].saturating_add(1);
+    }
+}
+
+#[inline(always)]
+fn chebyshev_adjacent(x: u16, y: u16, set: &std::collections::HashSet<(u16, u16)>) -> bool {
+    let xi = x as i32;
+    let yi = y as i32;
+    for dy in -1i32..=1 {
+        for dx in -1i32..=1 {
+            let nx = xi + dx;
+            let ny = yi + dy;
+            if nx >= 0 && ny >= 0 && set.contains(&(nx as u16, ny as u16)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// M13: PredatorSystem
+// ---------------------------------------------------------------------------
+
+/// Probabilidad de ataque exitoso por tick. simulation_spec.md §Predator.
+pub const PREDATOR_ATTACK_RATE: f32 = 0.3;
+/// Radio de detección Chebyshev (área 5×5 centrada en el depredador).
+pub const PREDATOR_DETECTION_RADIUS: u32 = 2;
+/// Energía drenada a la abeja atacada por impacto.
+pub const PREDATOR_ENERGY_DRAIN: f32 = 0.4;
+/// Feromona Alarm emitida por Guard cuando detecta un depredador en su radio.
+pub const PREDATOR_ALARM_EMISSION: f32 = 0.2;
+
+/// Movimiento, ataques y respuesta de Guards frente a depredadores.
+///
+/// - Fase 1: cada depredador se mueve siguiendo el gradiente de feromona Attraction
+///   (neighbors_8, Chebyshev ≤ 1) o hace paseo aleatorio si no hay gradiente.
+/// - Fase 2: cada depredador ataca una abeja aleatoria dentro de Chebyshev ≤ 2
+///   con probabilidad `attack_rate`. Si la abeja cae a energía 0, se mata en este tick.
+/// - Fase 3: Guards en radio Chebyshev ≤ 2 de un depredador emiten feromona Alarm.
+///
+/// Retorna el número de abejas muertas por depredación en este tick.
+pub fn run_predator_system(
+    world: &mut hecs::World,
+    grid: &mut SpatialGrid,
+    rng_system: &RngSystem,
+    tick: u64,
+) -> u32 {
+    // Fase 1 — Mover depredadores (collect → apply)
+    let predator_moves: Vec<(hecs::Entity, u16, u16, u16, u16)> = {
+        let mut moves = Vec::new();
+        for (entity, (pos, _pred)) in world
+            .query::<(&PositionComponent, &PredatorComponent)>()
+            .iter()
+        {
+            let x = pos.0 as usize;
+            let y = pos.1 as usize;
+
+            let valid: arrayvec::ArrayVec<(usize, usize), 8> = grid
+                .neighbors_8(x, y)
+                .into_iter()
+                .filter(|&(nx, ny)| !grid.is_obstacle[SpatialGrid::idx(nx, ny)])
+                .collect();
+
+            if valid.is_empty() {
+                continue;
+            }
+
+            let mut rng = rng_system.agent_rng_for_tick(entity.id() as u64, tick);
+
+            // Elige el vecino con mayor feromona Attraction; si todos < 0.05, paseo aleatorio
+            let max_attr = valid
+                .iter()
+                .map(|&(nx, ny)| grid.pheromone(nx, ny, PheromoneKind::Attraction))
+                .fold(0.0_f32, f32::max);
+
+            let chosen = if max_attr > 0.05 {
+                *valid
+                    .iter()
+                    .max_by(|&&(ax, ay), &&(bx, by)| {
+                        grid.pheromone(ax, ay, PheromoneKind::Attraction)
+                            .partial_cmp(&grid.pheromone(bx, by, PheromoneKind::Attraction))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .unwrap()
+            } else {
+                valid[rng.gen_range(0..valid.len())]
+            };
+
+            moves.push((entity, pos.0, pos.1, chosen.0 as u16, chosen.1 as u16));
+        }
+        moves
+    };
+
+    for (entity, ox, oy, nx, ny) in predator_moves {
+        let oi = SpatialGrid::idx(ox as usize, oy as usize);
+        let ni = SpatialGrid::idx(nx as usize, ny as usize);
+        debug_assert!(grid.occupancy[oi] > 0, "predator occupancy underflow en ({ox},{oy})");
+        grid.occupancy[oi] -= 1;
+        grid.occupancy[ni] = grid.occupancy[ni].saturating_add(1);
+        let _ = world.insert_one(entity, PositionComponent(nx, ny));
+    }
+
+    // Snapshot de entidades y posiciones de depredadores para fases 2 y 3
+    let predators: Vec<(hecs::Entity, usize, usize, f32, f32)> = world
+        .query::<(&PositionComponent, &PredatorComponent)>()
+        .iter()
+        .map(|(e, (pos, pred))| {
+            (e, pos.0 as usize, pos.1 as usize, pred.attack_rate, pred.energy_drain_on_hit)
+        })
+        .collect();
+
+    if predators.is_empty() {
+        return 0;
+    }
+
+    // Fase 2 — Ataques: snapshot de abejas → collect hits → apply
+    let bee_snapshot: Vec<(hecs::Entity, u16, u16, f32)> = world
+        .query::<(&PositionComponent, &EnergyComponent, &RoleComponent)>()
+        .iter()
+        .map(|(e, (pos, en, _))| (e, pos.0, pos.1, en.0))
+        .collect();
+
+    let mut energy_updates: Vec<(hecs::Entity, f32)> = Vec::new();
+    let mut to_kill: Vec<(hecs::Entity, u16, u16)> = Vec::new();
+
+    let radius = PREDATOR_DETECTION_RADIUS as i32;
+    for (pred_entity, px, py, attack_rate, energy_drain) in &predators {
+        let in_radius: Vec<(hecs::Entity, u16, u16, f32)> = bee_snapshot
+            .iter()
+            .filter(|&&(_, bx, by, _)| {
+                (bx as i32 - *px as i32).abs() <= radius
+                    && (by as i32 - *py as i32).abs() <= radius
+            })
+            .copied()
+            .collect();
+
+        if in_radius.is_empty() {
+            continue;
+        }
+
+        // RNG con id del depredador + offset para distinguir de la fase de movimiento
+        let mut rng = rng_system.agent_rng_for_tick(
+            pred_entity.id() as u64 ^ 0x5A5A_5A5A_u64,
+            tick,
+        );
+
+        if rng.gen::<f32>() < *attack_rate {
+            let target_idx = rng.gen_range(0..in_radius.len());
+            let (target_entity, tx, ty, old_energy) = in_radius[target_idx];
+            let new_energy = (old_energy - energy_drain).max(0.0);
+            if new_energy <= 0.0 {
+                to_kill.push((target_entity, tx, ty));
+            } else {
+                energy_updates.push((target_entity, new_energy));
+            }
+        }
+    }
+
+    for (entity, new_energy) in energy_updates {
+        let _ = world.insert_one(entity, EnergyComponent(new_energy));
+    }
+
+    let deaths = to_kill.len() as u32;
+    for (entity, x, y) in to_kill {
+        let idx = SpatialGrid::idx(x as usize, y as usize);
+        if grid.occupancy[idx] > 0 {
+            grid.occupancy[idx] -= 1;
+        }
+        let _ = world.despawn(entity);
+    }
+
+    // Fase 3 — Guards adyacentes a un depredador emiten feromona Alarm
+    let guard_positions: Vec<(u16, u16)> = world
+        .query::<(&PositionComponent, &RoleComponent)>()
+        .iter()
+        .filter_map(|(_, (pos, role))| {
+            if role.0 == Role::Guard { Some((pos.0, pos.1)) } else { None }
+        })
+        .collect();
+
+    for (gx, gy) in guard_positions {
+        let near = predators.iter().any(|&(_, px, py, _, _)| {
+            (gx as i32 - px as i32).abs() <= radius
+                && (gy as i32 - py as i32).abs() <= radius
+        });
+        if near {
+            grid.add_pheromone(
+                gx as usize,
+                gy as usize,
+                PheromoneKind::Alarm,
+                PREDATOR_ALARM_EMISSION,
+            );
+        }
+    }
+
+    deaths
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -445,7 +918,7 @@ mod tests {
             PositionComponent(x, y),
             RoleComponent(Role::Nurse),
             EnergyComponent(0.8),
-            HealthComponent(SirState::Susceptible),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
             AgeComponent(0),
             PheromoneSensitivity([1.0, 1.0, 1.0]),
         )
@@ -470,7 +943,7 @@ mod tests {
         assert_eq!(*pos, PositionComponent(50, 50));
         assert_eq!(role.0, Role::Nurse);
         assert!((energy.0 - 0.8).abs() < 1e-6);
-        assert_eq!(health.0, SirState::Susceptible);
+        assert_eq!(health.state, SirState::Susceptible);
         assert_eq!(age.0, 0);
         assert!((sens.0[0] - 1.0).abs() < 1e-6);
     }
@@ -1124,7 +1597,7 @@ mod tests {
             PositionComponent(x, y),
             RoleComponent(role),
             EnergyComponent(0.8),
-            HealthComponent(SirState::Susceptible),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
             AgeComponent(age),
             sens,
             RoleTransitionState { cooldown: 0, threshold_bias: 0.0 },
@@ -1141,7 +1614,7 @@ mod tests {
             PositionComponent(50, 50),
             RoleComponent(Role::Queen),
             EnergyComponent(0.8),
-            HealthComponent(SirState::Susceptible),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
             AgeComponent(0),
             PheromoneSensitivity([0.0, 0.0, 0.0]),
         ));
@@ -1160,7 +1633,7 @@ mod tests {
             PositionComponent(50, 50),
             RoleComponent(Role::Drone),
             EnergyComponent(0.8),
-            HealthComponent(SirState::Susceptible),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
             AgeComponent(0),
             PheromoneSensitivity([0.0, 0.0, 0.0]),
         ));
@@ -1197,7 +1670,7 @@ mod tests {
             PositionComponent(50, 50),
             RoleComponent(Role::Nurse),
             EnergyComponent(0.8),
-            HealthComponent(SirState::Susceptible),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
             AgeComponent(400), // age_factor(Forager,400)=1.0
             PheromoneSensitivity([0.0, 1.0, 0.0]),
             RoleTransitionState { cooldown: 15, threshold_bias: 0.0 },
@@ -1250,7 +1723,7 @@ mod tests {
             PositionComponent(30, 30),
             RoleComponent(Role::Forager),
             EnergyComponent(0.8),
-            HealthComponent(SirState::Susceptible),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
             AgeComponent(200),
             PheromoneSensitivity([0.0, 0.0, 1.0]),
             ForagerStateComponent(ForagerPhase::Searching),
@@ -1301,6 +1774,517 @@ mod tests {
         assert!((age_factor(Role::Forager, 0) - 0.0).abs() < 1e-6);
     }
 
+    // --- M11: BroodSystem -------------------------------------------------------
+
+    fn make_brood_world_with_queen() -> (hecs::World, SpatialGrid, RngSystem) {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        let idx = SpatialGrid::idx(50, 50);
+        grid.occupancy[idx] += 1;
+        world.spawn((
+            PositionComponent(50, 50),
+            RoleComponent(Role::Queen),
+            EnergyComponent(0.8),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
+            AgeComponent(0),
+            PheromoneSensitivity([0.0, 0.0, 0.0]),
+        ));
+        (world, grid, rng)
+    }
+
+    #[test]
+    fn egg_spawned_when_rate_one() {
+        let (mut world, mut grid, rng) = make_brood_world_with_queen();
+        run_brood_system(&mut world, &mut grid, &rng, 0, 1.0);
+        let count = world.query::<&BroodStageComponent>().iter().count();
+        assert_eq!(count, 1, "con rate=1.0 debe spawnearse exactamente 1 huevo");
+    }
+
+    #[test]
+    fn no_egg_spawned_when_rate_zero() {
+        let (mut world, mut grid, rng) = make_brood_world_with_queen();
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        let count = world.query::<&BroodStageComponent>().iter().count();
+        assert_eq!(count, 0, "con rate=0.0 no debe spawnearse nada");
+    }
+
+    #[test]
+    fn egg_transitions_to_larva_at_36() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(50, 50),
+            AgeComponent(BROOD_EGG_END),
+            BroodStageComponent(BroodStage::Egg),
+        ));
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        for (_, s) in world.query::<&BroodStageComponent>().iter() {
+            assert!(
+                matches!(s.0, BroodStage::Larva { .. }),
+                "egg con age=36 debe transicionar a Larva"
+            );
+        }
+    }
+
+    #[test]
+    fn larva_transitions_to_pupa_at_180() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(50, 50),
+            AgeComponent(BROOD_LARVA_END),
+            BroodStageComponent(BroodStage::Larva { health_virtual: 1.0 }),
+        ));
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        for (_, s) in world.query::<&BroodStageComponent>().iter() {
+            assert_eq!(s.0, BroodStage::Pupa, "larva con age=180 debe transicionar a Pupa");
+        }
+    }
+
+    #[test]
+    fn pupa_ecloses_at_300() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(50, 50),
+            AgeComponent(BROOD_PUPA_END),
+            BroodStageComponent(BroodStage::Pupa),
+        ));
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        let brood_left = world.query::<&BroodStageComponent>().iter().count();
+        assert_eq!(brood_left, 0, "pupa completa debe despawnearse");
+        let nurses = world.query::<&RoleComponent>().iter()
+            .filter(|(_, r)| r.0 == Role::Nurse).count();
+        assert_eq!(nurses, 1, "debe haber eclosionado 1 Nurse");
+    }
+
+    #[test]
+    fn eclosed_nurse_has_correct_components() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(40, 40),
+            AgeComponent(BROOD_PUPA_END),
+            BroodStageComponent(BroodStage::Pupa),
+        ));
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        for (_, (pos, role, energy, age)) in
+            world.query::<(&PositionComponent, &RoleComponent, &EnergyComponent, &AgeComponent)>().iter()
+        {
+            assert_eq!(role.0, Role::Nurse);
+            assert!((energy.0 - 0.8).abs() < 1e-5, "Energy debe ser 0.8, obtenido {}", energy.0);
+            assert_eq!(age.0, 0, "Age debe ser 0 al eclosionar");
+            assert_eq!((pos.0, pos.1), (40, 40), "posición debe coincidir con la pupa");
+        }
+    }
+
+    #[test]
+    fn larva_health_drains_without_nurse() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(50, 50),
+            AgeComponent(40), // age < BROOD_LARVA_END → no transiciona a Pupa
+            BroodStageComponent(BroodStage::Larva { health_virtual: 1.0 }),
+        ));
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        for (_, s) in world.query::<&BroodStageComponent>().iter() {
+            if let BroodStage::Larva { health_virtual } = s.0 {
+                assert!(
+                    (health_virtual - (1.0 - BROOD_HEALTH_DRAIN)).abs() < 1e-5,
+                    "health_virtual debe haber caído en {BROOD_HEALTH_DRAIN}, obtenido {health_virtual}"
+                );
+            } else {
+                panic!("debe seguir siendo Larva");
+            }
+        }
+    }
+
+    #[test]
+    fn larva_survives_with_adjacent_nurse() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        // Larva en (50, 50)
+        world.spawn((
+            PositionComponent(50, 50),
+            AgeComponent(40),
+            BroodStageComponent(BroodStage::Larva { health_virtual: 1.0 }),
+        ));
+        // Nurse adyacente en (51, 50)
+        world.spawn((
+            PositionComponent(51, 50),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
+            AgeComponent(0),
+            PheromoneSensitivity([0.0, 1.0, 0.0]),
+        ));
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        for (_, s) in world.query::<&BroodStageComponent>().iter() {
+            if let BroodStage::Larva { health_virtual } = s.0 {
+                assert!(
+                    (health_virtual - 1.0).abs() < 1e-5,
+                    "con Nurse adyacente health_virtual no debe caer, obtenido {health_virtual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn larva_dies_when_health_zero() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(50, 50),
+            AgeComponent(40),
+            BroodStageComponent(BroodStage::Larva { health_virtual: 0.0 }),
+        ));
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        let count = world.query::<&BroodStageComponent>().iter().count();
+        assert_eq!(count, 0, "larva con health_virtual=0 debe despawnearse");
+    }
+
+    #[test]
+    fn larva_emits_task_pheromone() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(50, 50),
+            AgeComponent(40),
+            BroodStageComponent(BroodStage::Larva { health_virtual: 1.0 }),
+        ));
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        grid.swap_pheromone_buffers();
+        let phero = grid.pheromone(50, 50, PheromoneKind::Task);
+        assert!(
+            phero > 0.0,
+            "larva debe emitir feromona Task en su celda, obtenido {phero}"
+        );
+    }
+
+    #[test]
+    fn occupancy_incremented_on_eclosion() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+        world.spawn((
+            PositionComponent(40, 40),
+            AgeComponent(BROOD_PUPA_END),
+            BroodStageComponent(BroodStage::Pupa),
+        ));
+        let before = grid.occupancy[SpatialGrid::idx(40, 40)];
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        let after = grid.occupancy[SpatialGrid::idx(40, 40)];
+        assert_eq!(after, before + 1, "eclosión debe incrementar occupancy en 1");
+    }
+
+    // --- M12: DiseaseSystem (SIR) -----------------------------------------------
+
+    fn make_bee_at(x: u16, y: u16, state: SirState, age: u32) -> (
+        PositionComponent,
+        RoleComponent,
+        EnergyComponent,
+        HealthComponent,
+        AgeComponent,
+        PheromoneSensitivity,
+    ) {
+        (
+            PositionComponent(x, y),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            HealthComponent { state, ticks_in_state: 0 },
+            AgeComponent(age),
+            PheromoneSensitivity([0.0, 1.0, 0.0]),
+        )
+    }
+
+    #[test]
+    fn susceptible_infected_near_infected() {
+        // base_rate=1.0, 1 Infected adyacente → P = 1.0 × 1 × 1.0 = 1.0 → siempre se infecta.
+        let mut world = hecs::World::new();
+        let rng = RngSystem::new(42);
+        let s_entity = world.spawn(make_bee_at(50, 50, SirState::Susceptible, 200));
+        world.spawn(make_bee_at(51, 50, SirState::Infected, 200));
+
+        run_disease_system(&mut world, &rng, 0, 1.0, true);
+
+        let mut q = world.query_one::<&HealthComponent>(s_entity).unwrap();
+        let h = q.get().unwrap();
+        assert_eq!(h.state, SirState::Infected, "Susceptible adyacente a Infected debe infectarse con base_rate=1.0");
+    }
+
+    #[test]
+    fn susceptible_far_from_infected_stays_s() {
+        let mut world = hecs::World::new();
+        let rng = RngSystem::new(42);
+        let s_entity = world.spawn(make_bee_at(10, 10, SirState::Susceptible, 200));
+        world.spawn(make_bee_at(80, 80, SirState::Infected, 200));
+
+        run_disease_system(&mut world, &rng, 0, 1.0, true);
+
+        let mut q = world.query_one::<&HealthComponent>(s_entity).unwrap();
+        let h = q.get().unwrap();
+        assert_eq!(h.state, SirState::Susceptible, "Susceptible lejos de Infected debe mantenerse S");
+    }
+
+    #[test]
+    fn disease_disabled_no_transmission() {
+        let mut world = hecs::World::new();
+        let rng = RngSystem::new(42);
+        let s_entity = world.spawn(make_bee_at(50, 50, SirState::Susceptible, 200));
+        world.spawn(make_bee_at(51, 50, SirState::Infected, 200));
+
+        run_disease_system(&mut world, &rng, 0, 1.0, false); // desactivado
+
+        let mut q = world.query_one::<&HealthComponent>(s_entity).unwrap();
+        let h = q.get().unwrap();
+        assert_eq!(h.state, SirState::Susceptible, "con disease_enabled=false no debe haber transmisión");
+    }
+
+    #[test]
+    fn infected_recovers_after_200_ticks() {
+        let mut world = hecs::World::new();
+        let rng = RngSystem::new(42);
+        let entity = world.spawn((
+            PositionComponent(50, 50),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            HealthComponent { state: SirState::Infected, ticks_in_state: DISEASE_INFECTION_DURATION },
+            AgeComponent(200),
+            PheromoneSensitivity([0.0, 1.0, 0.0]),
+        ));
+
+        run_disease_system(&mut world, &rng, 0, 0.0, true);
+
+        let mut q = world.query_one::<&HealthComponent>(entity).unwrap();
+        let h = q.get().unwrap();
+        assert_eq!(h.state, SirState::Recovered, "Infected con timer=200 debe pasar a Recovered");
+        // La Fase 4 (advance timers) corre en la misma llamada, por lo que el timer parte en 1.
+        assert_eq!(h.ticks_in_state, 1, "timer debe ser 1 tras transición + avance en mismo tick");
+    }
+
+    #[test]
+    fn recovered_returns_to_susceptible_at_300() {
+        let mut world = hecs::World::new();
+        let rng = RngSystem::new(42);
+        let entity = world.spawn((
+            PositionComponent(50, 50),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            HealthComponent { state: SirState::Recovered, ticks_in_state: DISEASE_RECOVERY_DURATION },
+            AgeComponent(200),
+            PheromoneSensitivity([0.0, 1.0, 0.0]),
+        ));
+
+        run_disease_system(&mut world, &rng, 0, 0.0, true);
+
+        let mut q = world.query_one::<&HealthComponent>(entity).unwrap();
+        let h = q.get().unwrap();
+        assert_eq!(h.state, SirState::Susceptible, "Recovered con timer=300 debe volver a Susceptible");
+    }
+
+    #[test]
+    fn timer_advances_per_tick_for_infected() {
+        let mut world = hecs::World::new();
+        let rng = RngSystem::new(42);
+        let entity = world.spawn((
+            PositionComponent(50, 50),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            HealthComponent { state: SirState::Infected, ticks_in_state: 5 },
+            AgeComponent(200),
+            PheromoneSensitivity([0.0, 1.0, 0.0]),
+        ));
+
+        run_disease_system(&mut world, &rng, 0, 0.0, true);
+
+        let mut q = world.query_one::<&HealthComponent>(entity).unwrap();
+        let h = q.get().unwrap();
+        assert_eq!(h.ticks_in_state, 6, "timer debe avanzar 1 por tick para Infected");
+    }
+
+    #[test]
+    fn susceptible_timer_does_not_advance() {
+        let mut world = hecs::World::new();
+        let rng = RngSystem::new(42);
+        let entity = world.spawn((
+            PositionComponent(50, 50),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
+            AgeComponent(200),
+            PheromoneSensitivity([0.0, 1.0, 0.0]),
+        ));
+
+        run_disease_system(&mut world, &rng, 0, 0.0, true);
+
+        let mut q = world.query_one::<&HealthComponent>(entity).unwrap();
+        let h = q.get().unwrap();
+        assert_eq!(h.ticks_in_state, 0, "timer no debe avanzar para Susceptible");
+    }
+
+    #[test]
+    fn young_bee_lower_susceptibility() {
+        // Con age < 100, susceptibility = 0.8 → con contact=1, base_rate=0.9: P = 0.9×1×0.8 = 0.72 < 1.
+        // Con age >= 100, susceptibility = 1.0 → P = 0.9×1×1.0 = 0.9.
+        // Verificamos que la proporción de infecciones es menor para abejas jóvenes.
+        let rng = RngSystem::new(42);
+        let mut young_infected = 0u32;
+        let mut old_infected   = 0u32;
+        let trials = 500u64;
+
+        for t in 0..trials {
+            let mut world = hecs::World::new();
+            // Joven susceptible (age=50)
+            let young = world.spawn((
+                PositionComponent(50, 50),
+                RoleComponent(Role::Nurse),
+                EnergyComponent(0.8),
+                HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
+                AgeComponent(50),
+                PheromoneSensitivity([0.0, 1.0, 0.0]),
+            ));
+            // Adulto susceptible (age=300)
+            let old = world.spawn((
+                PositionComponent(52, 50),
+                RoleComponent(Role::Nurse),
+                EnergyComponent(0.8),
+                HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
+                AgeComponent(300),
+                PheromoneSensitivity([0.0, 1.0, 0.0]),
+            ));
+            // Infectado adyacente a ambos
+            world.spawn((
+                PositionComponent(51, 50),
+                RoleComponent(Role::Nurse),
+                EnergyComponent(0.8),
+                HealthComponent { state: SirState::Infected, ticks_in_state: 0 },
+                AgeComponent(200),
+                PheromoneSensitivity([0.0, 1.0, 0.0]),
+            ));
+            run_disease_system(&mut world, &rng, t, 0.9, true);
+            if world.query_one::<&HealthComponent>(young).unwrap().get().unwrap().state == SirState::Infected { young_infected += 1; }
+            if world.query_one::<&HealthComponent>(old).unwrap().get().unwrap().state == SirState::Infected { old_infected += 1; }
+        }
+
+        assert!(
+            young_infected < old_infected,
+            "abejas jóvenes (age<100) deben infectarse menos que adultas: jóvenes={young_infected}, adultas={old_infected}"
+        );
+    }
+
+    #[test]
+    fn infected_energy_cost_higher() {
+        let mut world = hecs::World::new();
+        let infected = world.spawn((
+            EnergyComponent(1.0),
+            RoleComponent(Role::Nurse),
+            AgeComponent(0),
+            HealthComponent { state: SirState::Infected, ticks_in_state: 0 },
+        ));
+        let susceptible = world.spawn((
+            EnergyComponent(1.0),
+            RoleComponent(Role::Nurse),
+            AgeComponent(0),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
+        ));
+
+        run_energy_system(&mut world, 20.0, 0.0);
+
+        let ei = world.query_one::<&EnergyComponent>(infected).unwrap().get().unwrap().0;
+        let es = world.query_one::<&EnergyComponent>(susceptible).unwrap().get().unwrap().0;
+
+        // Infected: 1.0 - 0.02 × 1.20 = 1.0 - 0.024 = 0.976
+        assert!((ei - (1.0 - 0.024_f32)).abs() < 1e-5, "Infected debe perder 0.024/tick, obtenido {ei}");
+        // Susceptible: 1.0 - 0.02 × 1.0 = 0.98
+        assert!((es - 0.98_f32).abs() < 1e-5, "Susceptible debe perder 0.020/tick, obtenido {es}");
+        assert!(ei < es, "Infected debe perder más energía que Susceptible");
+    }
+
+    #[test]
+    fn infected_forager_gains_less() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let x = 30usize;
+        let y = 30usize;
+        grid.resource_amount[SpatialGrid::idx(x, y)] = 1.0;
+
+        let infected = world.spawn((
+            PositionComponent(x as u16, y as u16),
+            RoleComponent(Role::Forager),
+            EnergyComponent(0.0),
+            AgeComponent(0),
+            ForagerStateComponent(ForagerPhase::Searching),
+            HealthComponent { state: SirState::Infected, ticks_in_state: 0 },
+        ));
+
+        let mut honey = 0.0_f32;
+        let mut collected = 0.0_f32;
+        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+
+        let gained = world.query_one::<&EnergyComponent>(infected).unwrap().get().unwrap().0;
+        // Sin enfermedad: gain = min(1.0×2.0, 1.0) = 1.0 (energía completa)
+        // Con efficiency=0.70: gain = min(1.0×2.0×0.70, 1.0) = min(1.4, 1.0) = 1.0
+        // Ambos llegan a 1.0 (clampeado). Verificar con recurso menor para ver diferencia.
+        assert!(gained > 0.0, "Infected Forager debe ganar algo de energía: {gained}");
+        // Con recurso = 0.4 la diferencia sería visible; este test verifica que el sistema no crashea.
+    }
+
+    #[test]
+    fn infected_forager_gains_less_than_susceptible() {
+        // Recurso bajo (0.4) para que el clamp no oculte la diferencia.
+        let rng = RngSystem::new(42);
+        let x = 30usize;
+        let y = 30usize;
+
+        let run_forager = |state: SirState| -> f32 {
+            let mut world = hecs::World::new();
+            let mut grid = SpatialGrid::new();
+            grid.resource_amount[SpatialGrid::idx(x, y)] = 0.4;
+            let entity = world.spawn((
+                PositionComponent(x as u16, y as u16),
+                RoleComponent(Role::Forager),
+                EnergyComponent(0.0),
+                AgeComponent(0),
+                ForagerStateComponent(ForagerPhase::Searching),
+                HealthComponent { state, ticks_in_state: 0 },
+            ));
+            let mut honey = 0.0_f32;
+            let mut collected = 0.0_f32;
+            run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+            let _ = rng; // suppress unused
+            let energy = {
+                let mut q = world.query_one::<&EnergyComponent>(entity).unwrap();
+                q.get().unwrap().0
+            };
+            energy
+        };
+
+        let gain_s = run_forager(SirState::Susceptible);
+        let gain_i = run_forager(SirState::Infected);
+
+        assert!(
+            gain_i < gain_s,
+            "Infected Forager debe ganar menos energía: Susceptible={gain_s}, Infected={gain_i}"
+        );
+    }
+
+    #[test]
+    fn health_factor_not_regressed() {
+        assert!((health_factor(SirState::Susceptible) - 1.0).abs() < 1e-6);
+        assert!((health_factor(SirState::Infected)    - 0.5).abs() < 1e-6);
+        assert!((health_factor(SirState::Recovered)   - 0.9).abs() < 1e-6);
+    }
+
     #[test]
     fn returning_forager_moves_toward_hive() {
         let mut world = hecs::World::new();
@@ -1337,5 +2321,328 @@ mod tests {
             "Forager Returning debe acercarse a la colmena: dist inicial={}, final={}",
             initial_dist, final_dist
         );
+    }
+
+    // --- M13: PredatorSystem ---------------------------------------------------
+
+    fn make_predator(x: u16, y: u16) -> (PositionComponent, EnergyComponent, PredatorComponent) {
+        (
+            PositionComponent(x, y),
+            EnergyComponent(1.0),
+            PredatorComponent {
+                attack_rate: PREDATOR_ATTACK_RATE,
+                detection_radius: PREDATOR_DETECTION_RADIUS,
+                energy_drain_on_hit: PREDATOR_ENERGY_DRAIN,
+            },
+        )
+    }
+
+    #[test]
+    fn predator_attacks_bee_in_radius() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        // attack_rate=1.0 garantiza ataque en cada tick
+        grid.occupancy[SpatialGrid::idx(50, 50)] += 1;
+        world.spawn((
+            PositionComponent(50, 50),
+            EnergyComponent(1.0),
+            PredatorComponent { attack_rate: 1.0, detection_radius: 2, energy_drain_on_hit: PREDATOR_ENERGY_DRAIN },
+        ));
+
+        grid.occupancy[SpatialGrid::idx(51, 50)] += 1;
+        let bee = world.spawn((
+            PositionComponent(51, 50),
+            EnergyComponent(0.8),
+            RoleComponent(Role::Nurse),
+            AgeComponent(0),
+        ));
+
+        run_predator_system(&mut world, &mut grid, &rng, 0);
+
+        // 0.8 - 0.4 = 0.4 > 0: abeja sobrevive con energía reducida
+        let mut q = world.query_one::<&EnergyComponent>(bee).unwrap();
+        let e = q.get().unwrap().0;
+        assert!(
+            (e - 0.4).abs() < 1e-5,
+            "energía debe ser 0.4 tras ataque con drain=0.4, obtenida {e}"
+        );
+    }
+
+    #[test]
+    fn predator_no_attack_out_of_radius() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        grid.occupancy[SpatialGrid::idx(50, 50)] += 1;
+        world.spawn(make_predator(50, 50));
+
+        grid.occupancy[SpatialGrid::idx(60, 60)] += 1;
+        let bee = world.spawn((
+            PositionComponent(60, 60),
+            EnergyComponent(0.8),
+            RoleComponent(Role::Nurse),
+            AgeComponent(0),
+        ));
+
+        run_predator_system(&mut world, &mut grid, &rng, 0);
+
+        let mut q = world.query_one::<&EnergyComponent>(bee).unwrap();
+        let e = q.get().unwrap().0;
+        assert!(
+            (e - 0.8).abs() < 1e-6,
+            "abeja fuera de radio no debe ser atacada, energía={e}"
+        );
+    }
+
+    #[test]
+    fn predator_zero_attack_rate_no_drain() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        grid.occupancy[SpatialGrid::idx(50, 50)] += 1;
+        world.spawn((
+            PositionComponent(50, 50),
+            EnergyComponent(1.0),
+            PredatorComponent { attack_rate: 0.0, detection_radius: 2, energy_drain_on_hit: 0.4 },
+        ));
+
+        grid.occupancy[SpatialGrid::idx(51, 50)] += 1;
+        let bee = world.spawn((
+            PositionComponent(51, 50),
+            EnergyComponent(0.8),
+            RoleComponent(Role::Nurse),
+            AgeComponent(0),
+        ));
+
+        run_predator_system(&mut world, &mut grid, &rng, 0);
+
+        let mut q = world.query_one::<&EnergyComponent>(bee).unwrap();
+        let e = q.get().unwrap().0;
+        assert!(
+            (e - 0.8).abs() < 1e-6,
+            "con attack_rate=0.0 la abeja no debe perder energía, obtenida {e}"
+        );
+    }
+
+    #[test]
+    fn guard_emits_alarm_near_predator() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        grid.occupancy[SpatialGrid::idx(50, 50)] += 1;
+        world.spawn(make_predator(50, 50));
+
+        grid.occupancy[SpatialGrid::idx(51, 50)] += 1;
+        world.spawn((
+            PositionComponent(51, 50),
+            RoleComponent(Role::Guard),
+            EnergyComponent(0.8),
+            AgeComponent(0),
+        ));
+
+        run_predator_system(&mut world, &mut grid, &rng, 0);
+        // La feromona se escribió al write buffer; swap para leer con pheromone()
+        grid.swap_pheromone_buffers();
+
+        let alarm = grid.pheromone(51, 50, PheromoneKind::Alarm);
+        assert!(alarm > 0.0, "Guard junto a depredador debe emitir alarma, obtenido {alarm}");
+    }
+
+    #[test]
+    fn non_guard_no_alarm_emission() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        grid.occupancy[SpatialGrid::idx(50, 50)] += 1;
+        world.spawn(make_predator(50, 50));
+
+        grid.occupancy[SpatialGrid::idx(51, 50)] += 1;
+        world.spawn((
+            PositionComponent(51, 50),
+            RoleComponent(Role::Nurse),
+            EnergyComponent(0.8),
+            AgeComponent(0),
+        ));
+
+        run_predator_system(&mut world, &mut grid, &rng, 0);
+
+        let alarm = grid.pheromone(51, 50, PheromoneKind::Alarm);
+        assert!(
+            alarm < 1e-6,
+            "Nurse no debe emitir alarma aunque haya depredador, obtenido {alarm}"
+        );
+    }
+
+    #[test]
+    fn predator_kills_bee_low_energy() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        // attack_rate=1.0 garantiza ataque; energy 0.3 < drain 0.4 → muerte inmediata
+        grid.occupancy[SpatialGrid::idx(50, 50)] += 2; // predador + abeja en misma celda
+        world.spawn((
+            PositionComponent(50, 50),
+            EnergyComponent(1.0),
+            PredatorComponent { attack_rate: 1.0, detection_radius: 2, energy_drain_on_hit: 0.4 },
+        ));
+
+        let bee = world.spawn((
+            PositionComponent(50, 50),
+            EnergyComponent(0.3),
+            RoleComponent(Role::Nurse),
+            AgeComponent(0),
+        ));
+
+        let deaths = run_predator_system(&mut world, &mut grid, &rng, 0);
+
+        assert_eq!(deaths, 1, "debe retornar 1 muerte por depredación");
+        // hecs retorna Err(NoSuchEntity) para entidades despawneadas
+        assert!(
+            world.query_one::<&EnergyComponent>(bee).is_err(),
+            "abeja con energy 0.3 atacada con drain 0.4 debe ser despawneada"
+        );
+    }
+
+    #[test]
+    fn predator_follows_attraction_pheromone() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        // add_pheromone escribe al write buffer; swap lo mueve al read buffer para que
+        // pheromone() lo vea durante el movimiento del depredador.
+        grid.add_pheromone(52, 50, PheromoneKind::Attraction, 1.0);
+        grid.swap_pheromone_buffers();
+
+        grid.occupancy[SpatialGrid::idx(51, 50)] += 1;
+        world.spawn(make_predator(51, 50));
+
+        run_predator_system(&mut world, &mut grid, &rng, 0);
+
+        let pos = world
+            .query::<(&PositionComponent, &PredatorComponent)>()
+            .iter()
+            .next()
+            .map(|(_, (p, _))| (p.0, p.1))
+            .unwrap();
+
+        assert_eq!(
+            pos,
+            (52, 50),
+            "depredador debe moverse hacia feromona Attraction máxima en (52,50)"
+        );
+    }
+
+    #[test]
+    fn predator_random_walk_no_pheromone() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        grid.occupancy[SpatialGrid::idx(50, 50)] += 1;
+        world.spawn(make_predator(50, 50));
+
+        run_predator_system(&mut world, &mut grid, &rng, 0);
+
+        let pos = world
+            .query::<(&PositionComponent, &PredatorComponent)>()
+            .iter()
+            .next()
+            .map(|(_, (p, _))| (p.0, p.1))
+            .unwrap();
+
+        assert!(
+            pos != (50, 50),
+            "depredador sin feromonas debe moverse desde (50,50)"
+        );
+    }
+
+    #[test]
+    fn no_predators_no_deaths() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let rng = RngSystem::new(42);
+
+        grid.occupancy[SpatialGrid::idx(50, 50)] += 1;
+        world.spawn((
+            PositionComponent(50, 50),
+            EnergyComponent(0.8),
+            RoleComponent(Role::Nurse),
+            AgeComponent(0),
+        ));
+
+        let deaths = run_predator_system(&mut world, &mut grid, &rng, 0);
+        assert_eq!(deaths, 0, "sin depredadores no debe haber muertes");
+    }
+
+    // --- M14: MortalitySystem — desglose por causa --------------------------------
+
+    #[test]
+    fn mortality_infected_counts_as_disease() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let idx = SpatialGrid::idx(50, 50);
+        grid.occupancy[idx] = 1;
+        world.spawn((
+            PositionComponent(50, 50),
+            EnergyComponent(0.0),
+            AgeComponent(0),
+            HealthComponent { state: SirState::Infected, ticks_in_state: 0 },
+        ));
+
+        let (by_energy, by_disease) = run_mortality_system(&mut world, &mut grid);
+        assert_eq!(by_disease, 1, "Infected que muere debe contar como disease");
+        assert_eq!(by_energy, 0);
+    }
+
+    #[test]
+    fn mortality_susceptible_counts_as_energy() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        let idx = SpatialGrid::idx(50, 50);
+        grid.occupancy[idx] = 1;
+        world.spawn((
+            PositionComponent(50, 50),
+            EnergyComponent(0.0),
+            AgeComponent(0),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
+        ));
+
+        let (by_energy, by_disease) = run_mortality_system(&mut world, &mut grid);
+        assert_eq!(by_energy, 1, "Susceptible que muere debe contar como energy");
+        assert_eq!(by_disease, 0);
+    }
+
+    #[test]
+    fn mortality_mixed_causes() {
+        let mut world = hecs::World::new();
+        let mut grid = SpatialGrid::new();
+        grid.occupancy[SpatialGrid::idx(50, 50)] = 3;
+        // 2 infectadas + 1 susceptible, todas con energy=0
+        for _ in 0..2 {
+            world.spawn((
+                PositionComponent(50, 50),
+                EnergyComponent(0.0),
+                AgeComponent(0),
+                HealthComponent { state: SirState::Infected, ticks_in_state: 0 },
+            ));
+        }
+        world.spawn((
+            PositionComponent(50, 50),
+            EnergyComponent(0.0),
+            AgeComponent(0),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
+        ));
+
+        let (by_energy, by_disease) = run_mortality_system(&mut world, &mut grid);
+        assert_eq!(by_disease, 2, "2 infectadas deben contar como disease");
+        assert_eq!(by_energy, 1, "1 susceptible debe contar como energy");
     }
 }

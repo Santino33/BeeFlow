@@ -21,12 +21,12 @@ impl Default for RunConfig {
         Self {
             seed: 42,
             initial_population: 500,
-            initial_honey_reserve: 0.8,
+            initial_honey_reserve: 10.0,
             disease_enabled: false,
             disease_base_rate: 0.05,
             pesticide_pressure: 0.0,
             predator_count: 0,
-            season_start: 0.0,
+            season_start: 0.5,
             simulation_speed: 30,
             max_ticks: None,
         }
