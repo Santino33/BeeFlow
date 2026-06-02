@@ -192,7 +192,7 @@ pub fn run_age_system(world: &mut hecs::World) {
 /// Foragers reciben drain adicional de `0.001 × pesticide_pressure` por pesticidas (M10).
 /// Infected: ×DISEASE_ENERGY_MULTIPLIER sobre el costo total (M12).
 /// La energía se clampea a 0.0; la muerte la gestiona MortalitySystem (M5).
-pub fn run_energy_system(world: &mut hecs::World, global_temp: f32, pesticide_pressure: f32) {
+pub fn run_energy_system(world: &mut hecs::World, global_temp: f32, pesticide_pressure: f32, metabolic_rate: f32) {
     let temp_factor = 1.0 + 0.01 * (global_temp - 20.0);
     for (_, (energy, role, health)) in world.query_mut::<(
         &mut EnergyComponent,
@@ -201,7 +201,7 @@ pub fn run_energy_system(world: &mut hecs::World, global_temp: f32, pesticide_pr
     )>() {
         let base_cost = match role.map(|r| r.0) {
             Some(Role::Drone) => 0.025,
-            _                 => METABOLIC_COST_BASAL,
+            _                 => metabolic_rate,
         };
         let extra_cost = if role.map(|r| r.0) == Some(Role::Forager) {
             0.001 * pesticide_pressure
@@ -258,6 +258,7 @@ pub fn run_foraging_system(
     grid: &mut SpatialGrid,
     honey_reserve: &mut f32,
     honey_collected: &mut f32,
+    emission_mult: f32,
 ) {
     for (_, (pos, role, energy, state, health)) in world.query_mut::<(
         &PositionComponent,
@@ -291,7 +292,7 @@ pub fn run_foraging_system(
                     // Carry: recurso adicional para la colmena
                     let carry = (res - personal_consumed).min(FORAGER_CARRY_MAX);
                     grid.resource_amount[idx] = (res - personal_consumed - carry).max(0.0);
-                    grid.add_pheromone(x, y, PheromoneKind::Attraction, FORAGER_PHEROMONE_EMISSION);
+                    grid.add_pheromone(x, y, PheromoneKind::Attraction, FORAGER_PHEROMONE_EMISSION * emission_mult);
                     state.0 = ForagerPhase::Returning { carry };
                 }
             }
@@ -365,10 +366,10 @@ pub const TROPHALLAXIS_TRANSFER_RATE: f32 = 0.05;
 /// Activado solo cuando `honey_reserve < TROPHALLAXIS_RESERVE_THRESHOLD`.
 /// Por cada par en celdas adyacentes (Chebyshev ≤ 1): transfiere `TROPHALLAXIS_TRANSFER_RATE`
 /// de la abeja con más energía a la de menos. simulation_spec.md §Energy.
-pub fn run_trophallaxis_system(world: &mut hecs::World, honey_reserve: f32) {
+pub fn run_trophallaxis_system(world: &mut hecs::World, honey_reserve: f32, threshold: f32) {
     use std::collections::HashMap;
 
-    if honey_reserve >= TROPHALLAXIS_RESERVE_THRESHOLD {
+    if honey_reserve >= threshold {
         return;
     }
 
@@ -670,6 +671,7 @@ pub fn run_brood_system(
     rng_system: &RngSystem,
     tick: u64,
     brood_production_rate: f32,
+    emission_mult: f32,
 ) {
     // Fase 1 — Queen pone huevo
     if brood_production_rate > 0.0 {
@@ -719,7 +721,7 @@ pub fn run_brood_system(
                 }
             }
             BroodStage::Larva { ref mut health_virtual } => {
-                grid.add_pheromone(x, y, PheromoneKind::Task, BROOD_TASK_EMISSION);
+                grid.add_pheromone(x, y, PheromoneKind::Task, BROOD_TASK_EMISSION * emission_mult);
 
                 let has_nurse = chebyshev_adjacent(pos.0, pos.1, &nurse_positions);
                 if !has_nurse {
@@ -1124,15 +1126,17 @@ mod tests {
             world.spawn((PositionComponent(50, 50), EnergyComponent(1.0), AgeComponent(0)));
         }
 
-        for _ in 0..51 {
-            run_energy_system(&mut world, 20.0, 0.0);
+        // Con METABOLIC_COST_BASAL = 0.001 y energy inicial = 1.0, bees viven ~1000 ticks
+        let ticks_to_death = (1.0_f32 / METABOLIC_COST_BASAL).ceil() as usize + 1;
+        for _ in 0..ticks_to_death {
+            run_energy_system(&mut world, 20.0, 0.0, METABOLIC_COST_BASAL);
             run_mortality_system(&mut world, &mut grid);
         }
 
         assert_eq!(
             world.query::<&EnergyComponent>().iter().count(),
             0,
-            "todas las abejas deben haber muerto en ~51 ticks (1.0 / 0.02 con f32)"
+            "todas las abejas deben haber muerto tras {ticks_to_death} ticks (1.0 / METABOLIC_COST_BASAL)"
         );
     }
 
@@ -1143,12 +1147,13 @@ mod tests {
         let mut world = hecs::World::new();
         world.spawn(make_bee(50, 50)); // energy = 0.8
 
-        run_energy_system(&mut world, 20.0, 0.0);
+        run_energy_system(&mut world, 20.0, 0.0, METABOLIC_COST_BASAL);
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
+            let expected = 0.8 - METABOLIC_COST_BASAL;
             assert!(
-                (energy.0 - 0.78).abs() < 1e-5,
-                "energy esperada 0.78, obtenida {}",
+                (energy.0 - expected).abs() < 1e-5,
+                "energy esperada {expected}, obtenida {}",
                 energy.0
             );
         }
@@ -1159,7 +1164,7 @@ mod tests {
         let mut world = hecs::World::new();
         world.spawn((EnergyComponent(0.01), AgeComponent(0)));
 
-        run_energy_system(&mut world, 20.0, 0.0);
+        run_energy_system(&mut world, 20.0, 0.0, METABOLIC_COST_BASAL);
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
             assert!(energy.0 >= 0.0, "energy no debe ser negativa");
@@ -1171,14 +1176,15 @@ mod tests {
         let mut world = hecs::World::new();
         world.spawn((EnergyComponent(1.0), AgeComponent(0)));
 
-        for _ in 0..50 {
-            run_energy_system(&mut world, 20.0, 0.0);
+        let ticks = (1.0_f32 / METABOLIC_COST_BASAL).ceil() as usize;
+        for _ in 0..ticks {
+            run_energy_system(&mut world, 20.0, 0.0, METABOLIC_COST_BASAL);
         }
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
             assert!(
                 energy.0 < 1e-5,
-                "energy debe ser ~0 tras 50 ticks, obtenida {}",
+                "energy debe ser ~0 tras {ticks} ticks, obtenida {}",
                 energy.0
             );
         }
@@ -1189,14 +1195,13 @@ mod tests {
         let mut world = hecs::World::new();
         world.spawn((EnergyComponent(1.0), AgeComponent(0)));
 
-        run_energy_system(&mut world, 30.0, 0.0); // factor = 1 + 0.01*10 = 1.1 → cost = 0.022
+        run_energy_system(&mut world, 30.0, 0.0, METABOLIC_COST_BASAL); // factor = 1 + 0.01*10 = 1.1
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
-            let expected = 1.0 - 0.022_f32;
+            let expected = 1.0 - METABOLIC_COST_BASAL * 1.1;
             assert!(
                 (energy.0 - expected).abs() < 1e-5,
-                "a 30°C energy esperada {}, obtenida {}",
-                expected,
+                "a 30°C energy esperada {expected}, obtenida {}",
                 energy.0
             );
         }
@@ -1253,7 +1258,7 @@ mod tests {
         let mut world = hecs::World::new();
         world.spawn((EnergyComponent(1.0), RoleComponent(Role::Drone), AgeComponent(0)));
 
-        run_energy_system(&mut world, 20.0, 0.0);
+        run_energy_system(&mut world, 20.0, 0.0, METABOLIC_COST_BASAL);
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
             let expected = 1.0_f32 - 0.025;
@@ -1358,7 +1363,7 @@ mod tests {
 
         let mut honey = 0.0_f32;
         let mut collected = 0.0_f32;
-        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected, 1.0);
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
             assert!(energy.0 > 0.5, "Forager debe haber ganado energía personal, obtenido {}", energy.0);
@@ -1383,7 +1388,7 @@ mod tests {
 
         let mut honey = 0.0_f32;
         let mut collected = 0.0_f32;
-        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected, 1.0);
 
         // Recurso decrece
         assert!(grid.resource_amount[SpatialGrid::idx(x, y)] < 0.8, "recurso debe haber disminuido");
@@ -1415,7 +1420,7 @@ mod tests {
 
         let mut honey = 0.0_f32;
         let mut collected = 0.0_f32;
-        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected, 1.0);
         // La feromona queda en write_buf; visible tras swap
         grid.swap_pheromone_buffers();
 
@@ -1439,7 +1444,7 @@ mod tests {
 
         let mut honey = 0.0_f32;
         let mut collected = 0.0_f32;
-        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected, 1.0);
 
         for (_, state) in world.query::<&ForagerStateComponent>().iter() {
             assert_eq!(state.0, ForagerPhase::Searching, "sin recurso el Forager sigue Searching");
@@ -1464,7 +1469,7 @@ mod tests {
 
         let mut honey = 0.5_f32;
         let mut collected = 0.0_f32;
-        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected, 1.0);
 
         assert!((honey - (0.5 + carry)).abs() < 1e-5, "honey_reserve debe aumentar en carry={}", carry);
         assert!((collected - carry).abs() < 1e-5);
@@ -1492,7 +1497,7 @@ mod tests {
 
         let mut honey = 0.0_f32;
         let mut collected = 0.0_f32;
-        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected, 1.0);
 
         assert_eq!(honey, 0.0, "no debe depositar lejos de la colmena");
         for (_, state) in world.query::<&ForagerStateComponent>().iter() {
@@ -1509,7 +1514,8 @@ mod tests {
         run_resource_regeneration(&mut grid, &sources, 1.0);
 
         let res = grid.resource_amount[SpatialGrid::idx(20, 50)];
-        assert!((res - 0.501).abs() < 1e-5, "recurso debe haber crecido en 0.001, obtenido {}", res);
+        let expected = 0.5 + RESOURCE_REGEN_RATE;
+        assert!((res - expected).abs() < 1e-5, "recurso debe haber crecido en {RESOURCE_REGEN_RATE}, obtenido {res}");
     }
 
     #[test]
@@ -1540,23 +1546,27 @@ mod tests {
             AgeComponent(0),
         ));
 
-        run_energy_system(&mut world, 20.0, 1.0); // pesticide_pressure = 1.0
+        run_energy_system(&mut world, 20.0, 1.0, METABOLIC_COST_BASAL); // pesticide_pressure = 1.0
 
         let mut qf = world.query_one::<&EnergyComponent>(forager).unwrap();
         let mut qn = world.query_one::<&EnergyComponent>(nurse).unwrap();
         let forager_energy = qf.get().unwrap().0;
         let nurse_energy   = qn.get().unwrap().0;
 
-        // Forager pierde METABOLIC_COST_BASAL + 0.001 * 1.0 = 0.021
+        // Forager pierde METABOLIC_COST_BASAL + 0.001 * pesticide_pressure
+        let forager_expected = 1.0 - METABOLIC_COST_BASAL - 0.001 * 1.0;
         assert!(
-            (forager_energy - (1.0 - 0.021)).abs() < 1e-5,
-            "Forager debe perder 0.021/tick con pesticida=1.0, obtenido {}",
+            (forager_energy - forager_expected).abs() < 1e-5,
+            "Forager debe perder {}/tick con pesticida=1.0, obtenido {}",
+            1.0 - forager_expected,
             forager_energy
         );
         // Nurse no tiene extra drain
+        let nurse_expected = 1.0 - METABOLIC_COST_BASAL;
         assert!(
-            (nurse_energy - (1.0 - 0.020)).abs() < 1e-5,
-            "Nurse debe perder solo 0.020/tick, obtenido {}",
+            (nurse_energy - nurse_expected).abs() < 1e-5,
+            "Nurse debe perder solo {}/tick, obtenido {}",
+            1.0 - nurse_expected,
             nurse_energy
         );
     }
@@ -1569,7 +1579,8 @@ mod tests {
         world.spawn((PositionComponent(30, 30), EnergyComponent(0.8), AgeComponent(0)));
         world.spawn((PositionComponent(31, 30), EnergyComponent(0.3), AgeComponent(0)));
 
-        run_trophallaxis_system(&mut world, 0.5); // reserve >= 0.30 → no-op
+        // Para que trofallaxis NO se active, reserve debe ser >= TROPHALLAXIS_RESERVE_THRESHOLD
+        run_trophallaxis_system(&mut world, TROPHALLAXIS_RESERVE_THRESHOLD + 1.0, TROPHALLAXIS_RESERVE_THRESHOLD);
 
         let energies: Vec<f32> = world.query::<&EnergyComponent>().iter()
             .map(|(_, e)| e.0).collect();
@@ -1583,7 +1594,7 @@ mod tests {
         let e_high = world.spawn((PositionComponent(30, 30), EnergyComponent(0.8), AgeComponent(0)));
         let e_low  = world.spawn((PositionComponent(31, 30), EnergyComponent(0.3), AgeComponent(0)));
 
-        run_trophallaxis_system(&mut world, 0.1); // reserve < 0.30
+        run_trophallaxis_system(&mut world, 0.1, TROPHALLAXIS_RESERVE_THRESHOLD); // reserve < 0.30
 
         let mut q_high = world.query_one::<&EnergyComponent>(e_high).unwrap();
         let mut q_low  = world.query_one::<&EnergyComponent>(e_low).unwrap();
@@ -1600,7 +1611,7 @@ mod tests {
         let e_high = world.spawn((PositionComponent(30, 30), EnergyComponent(0.7), AgeComponent(0)));
         let e_low  = world.spawn((PositionComponent(30, 30), EnergyComponent(0.2), AgeComponent(0)));
 
-        run_trophallaxis_system(&mut world, 0.1);
+        run_trophallaxis_system(&mut world, 0.1, TROPHALLAXIS_RESERVE_THRESHOLD);
 
         let mut q_high = world.query_one::<&EnergyComponent>(e_high).unwrap();
         let mut q_low  = world.query_one::<&EnergyComponent>(e_low).unwrap();
@@ -1614,7 +1625,7 @@ mod tests {
         world.spawn((PositionComponent(10, 10), EnergyComponent(0.9), AgeComponent(0)));
         world.spawn((PositionComponent(30, 30), EnergyComponent(0.1), AgeComponent(0)));
 
-        run_trophallaxis_system(&mut world, 0.1);
+        run_trophallaxis_system(&mut world, 0.1, TROPHALLAXIS_RESERVE_THRESHOLD);
 
         let mut energies: Vec<f32> = world.query::<&EnergyComponent>().iter()
             .map(|(_, e)| e.0).collect();
@@ -1629,7 +1640,7 @@ mod tests {
         let e_donor = world.spawn((PositionComponent(30, 30), EnergyComponent(0.03), AgeComponent(0)));
         world.spawn((PositionComponent(31, 30), EnergyComponent(0.0), AgeComponent(0)));
 
-        run_trophallaxis_system(&mut world, 0.1);
+        run_trophallaxis_system(&mut world, 0.1, TROPHALLAXIS_RESERVE_THRESHOLD);
 
         let mut q = world.query_one::<&EnergyComponent>(e_donor).unwrap();
         let after = q.get().unwrap().0;
@@ -1642,7 +1653,7 @@ mod tests {
         world.spawn((PositionComponent(30, 30), EnergyComponent(0.5), AgeComponent(0)));
         world.spawn((PositionComponent(31, 30), EnergyComponent(0.5), AgeComponent(0)));
 
-        run_trophallaxis_system(&mut world, 0.1);
+        run_trophallaxis_system(&mut world, 0.1, TROPHALLAXIS_RESERVE_THRESHOLD);
 
         for (_, en) in world.query::<&EnergyComponent>().iter() {
             assert!((en.0 - 0.5).abs() < 1e-5, "abejas con igual energía no deben cambiar");
@@ -1654,7 +1665,7 @@ mod tests {
         let mut world = hecs::World::new();
         let entity = world.spawn((PositionComponent(30, 30), EnergyComponent(0.6), AgeComponent(0)));
 
-        run_trophallaxis_system(&mut world, 0.1);
+        run_trophallaxis_system(&mut world, 0.1, TROPHALLAXIS_RESERVE_THRESHOLD);
 
         let mut q = world.query_one::<&EnergyComponent>(entity).unwrap();
         assert!((q.get().unwrap().0 - 0.6).abs() < 1e-5, "abeja sola no debe cambiar");
@@ -1880,7 +1891,7 @@ mod tests {
     #[test]
     fn egg_spawned_when_rate_one() {
         let (mut world, mut grid, rng) = make_brood_world_with_queen();
-        run_brood_system(&mut world, &mut grid, &rng, 0, 1.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 1.0, 1.0);
         let count = world.query::<&BroodStageComponent>().iter().count();
         assert_eq!(count, 1, "con rate=1.0 debe spawnearse exactamente 1 huevo");
     }
@@ -1888,7 +1899,7 @@ mod tests {
     #[test]
     fn no_egg_spawned_when_rate_zero() {
         let (mut world, mut grid, rng) = make_brood_world_with_queen();
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         let count = world.query::<&BroodStageComponent>().iter().count();
         assert_eq!(count, 0, "con rate=0.0 no debe spawnearse nada");
     }
@@ -1903,7 +1914,7 @@ mod tests {
             AgeComponent(BROOD_EGG_END),
             BroodStageComponent(BroodStage::Egg),
         ));
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         for (_, s) in world.query::<&BroodStageComponent>().iter() {
             assert!(
                 matches!(s.0, BroodStage::Larva { .. }),
@@ -1922,7 +1933,7 @@ mod tests {
             AgeComponent(BROOD_LARVA_END),
             BroodStageComponent(BroodStage::Larva { health_virtual: 1.0 }),
         ));
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         for (_, s) in world.query::<&BroodStageComponent>().iter() {
             assert_eq!(s.0, BroodStage::Pupa, "larva con age=180 debe transicionar a Pupa");
         }
@@ -1938,7 +1949,7 @@ mod tests {
             AgeComponent(BROOD_PUPA_END),
             BroodStageComponent(BroodStage::Pupa),
         ));
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         let brood_left = world.query::<&BroodStageComponent>().iter().count();
         assert_eq!(brood_left, 0, "pupa completa debe despawnearse");
         let nurses = world.query::<&RoleComponent>().iter()
@@ -1956,7 +1967,7 @@ mod tests {
             AgeComponent(BROOD_PUPA_END),
             BroodStageComponent(BroodStage::Pupa),
         ));
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         for (_, (pos, role, energy, age)) in
             world.query::<(&PositionComponent, &RoleComponent, &EnergyComponent, &AgeComponent)>().iter()
         {
@@ -1977,7 +1988,7 @@ mod tests {
             AgeComponent(40), // age < BROOD_LARVA_END → no transiciona a Pupa
             BroodStageComponent(BroodStage::Larva { health_virtual: 1.0 }),
         ));
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         for (_, s) in world.query::<&BroodStageComponent>().iter() {
             if let BroodStage::Larva { health_virtual } = s.0 {
                 assert!(
@@ -2010,7 +2021,7 @@ mod tests {
             AgeComponent(0),
             PheromoneSensitivity([0.0, 1.0, 0.0]),
         ));
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         for (_, s) in world.query::<&BroodStageComponent>().iter() {
             if let BroodStage::Larva { health_virtual } = s.0 {
                 assert!(
@@ -2031,7 +2042,7 @@ mod tests {
             AgeComponent(40),
             BroodStageComponent(BroodStage::Larva { health_virtual: 0.0 }),
         ));
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         let count = world.query::<&BroodStageComponent>().iter().count();
         assert_eq!(count, 0, "larva con health_virtual=0 debe despawnearse");
     }
@@ -2046,7 +2057,7 @@ mod tests {
             AgeComponent(40),
             BroodStageComponent(BroodStage::Larva { health_virtual: 1.0 }),
         ));
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         grid.swap_pheromone_buffers();
         let phero = grid.pheromone(50, 50, PheromoneKind::Task);
         assert!(
@@ -2066,7 +2077,7 @@ mod tests {
             BroodStageComponent(BroodStage::Pupa),
         ));
         let before = grid.occupancy[SpatialGrid::idx(40, 40)];
-        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0);
+        run_brood_system(&mut world, &mut grid, &rng, 0, 0.0, 1.0);
         let after = grid.occupancy[SpatialGrid::idx(40, 40)];
         assert_eq!(after, before + 1, "eclosión debe incrementar occupancy en 1");
     }
@@ -2282,15 +2293,17 @@ mod tests {
             HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
         ));
 
-        run_energy_system(&mut world, 20.0, 0.0);
+        run_energy_system(&mut world, 20.0, 0.0, METABOLIC_COST_BASAL);
 
         let ei = world.query_one::<&EnergyComponent>(infected).unwrap().get().unwrap().0;
         let es = world.query_one::<&EnergyComponent>(susceptible).unwrap().get().unwrap().0;
 
-        // Infected: 1.0 - 0.02 × 1.20 = 1.0 - 0.024 = 0.976
-        assert!((ei - (1.0 - 0.024_f32)).abs() < 1e-5, "Infected debe perder 0.024/tick, obtenido {ei}");
-        // Susceptible: 1.0 - 0.02 × 1.0 = 0.98
-        assert!((es - 0.98_f32).abs() < 1e-5, "Susceptible debe perder 0.020/tick, obtenido {es}");
+        // Infected: METABOLIC_COST_BASAL × DISEASE_ENERGY_MULTIPLIER (1.20)
+        let expected_infected = 1.0 - METABOLIC_COST_BASAL * 1.20;
+        assert!((ei - expected_infected).abs() < 1e-5, "Infected debe perder {}/tick, obtenido {ei}", METABOLIC_COST_BASAL * 1.20);
+        // Susceptible: METABOLIC_COST_BASAL × 1.0
+        let expected_susceptible = 1.0 - METABOLIC_COST_BASAL;
+        assert!((es - expected_susceptible).abs() < 1e-5, "Susceptible debe perder {}/tick, obtenido {es}", METABOLIC_COST_BASAL);
         assert!(ei < es, "Infected debe perder más energía que Susceptible");
     }
 
@@ -2313,7 +2326,7 @@ mod tests {
 
         let mut honey = 0.0_f32;
         let mut collected = 0.0_f32;
-        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+        run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected, 1.0);
 
         let gained = world.query_one::<&EnergyComponent>(infected).unwrap().get().unwrap().0;
         // Sin enfermedad: gain = min(1.0×2.0, 1.0) = 1.0 (energía completa)
@@ -2344,7 +2357,7 @@ mod tests {
             ));
             let mut honey = 0.0_f32;
             let mut collected = 0.0_f32;
-            run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected);
+            run_foraging_system(&mut world, &mut grid, &mut honey, &mut collected, 1.0);
             let _ = rng; // suppress unused
             let energy = {
                 let mut q = world.query_one::<&EnergyComponent>(entity).unwrap();

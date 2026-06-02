@@ -16,6 +16,8 @@ pub struct SystemDynamicsState {
     pub pollen_reserve: f32,
     /// Presión de pesticidas [0.0, 1.0]. Drain extra de energía para Foragers.
     pub pesticide_pressure: f32,
+    /// Override manual de temperatura desde la UI. `None` = seguir el ciclo estacional.
+    pub manual_temp: Option<f32>,
 }
 
 impl SystemDynamicsState {
@@ -28,6 +30,7 @@ impl SystemDynamicsState {
             brood_production_rate: 0.0,
             pollen_reserve: 1.0,
             pesticide_pressure: config.pesticide_pressure,
+            manual_temp: None,
         }
     }
 
@@ -117,7 +120,7 @@ mod tests {
     #[test]
     fn brood_rate_positive_in_summer() {
         let mut state = make_state(0.5);
-        state.update(1.0); // honey_reserve = 1.0
+        state.update(20.0); // honey_reserve = 20.0 → reserve_factor = 1.0
         assert!(
             state.brood_production_rate > 0.09,
             "brood_rate debe ser ≈0.1 en verano con reservas llenas, obtenido {}",

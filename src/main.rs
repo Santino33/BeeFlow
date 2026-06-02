@@ -33,10 +33,12 @@ fn main() {
         use std::time::Duration;
 
         let tick_duration = Duration::from_secs_f64(1.0 / config.simulation_speed as f64);
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (render_tx, render_rx) = mpsc::sync_channel(1);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<beeflow::visualizer::SimCommand>();
 
         let mut orchestrator = Orchestrator::new(config);
-        orchestrator.set_render_sender(tx);
+        orchestrator.set_render_sender(render_tx);
+        orchestrator.set_command_receiver(cmd_rx);
 
         std::thread::spawn(move || {
             orchestrator.run();
@@ -53,7 +55,7 @@ fn main() {
             "BeeFlow",
             native_options,
             Box::new(move |_cc| {
-                Ok(Box::new(beeflow::visualizer::VisualizerApp::new(rx, tick_duration))
+                Ok(Box::new(beeflow::visualizer::VisualizerApp::new(render_rx, tick_duration, Some(cmd_tx)))
                     as Box<dyn eframe::App>)
             }),
         )

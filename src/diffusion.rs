@@ -18,6 +18,8 @@ const KERNEL: [f32; 3] = [0.25, 0.5, 0.25];
 /// - Paralelización entre los 3 canales independientes (rayon, H6)
 pub struct DiffusionSystem {
     temps: [Vec<f32>; PHEROMONE_CHANNELS], // un buffer intermedio H→V por canal
+    /// Tasa de decaimiento por tick, configurable en tiempo real desde la UI.
+    pub decay_rate: f32,
 }
 
 impl DiffusionSystem {
@@ -28,6 +30,7 @@ impl DiffusionSystem {
                 vec![0.0; TOTAL_CELLS],
                 vec![0.0; TOTAL_CELLS],
             ],
+            decay_rate: DECAY_RATE,
         }
     }
 
@@ -35,16 +38,20 @@ impl DiffusionSystem {
     /// Los 3 canales son independientes entre sí y se procesan con rayon::zip.
     pub fn step(&mut self, grid: &mut SpatialGrid) {
         let (channel_bufs, obs) = grid.all_channel_bufs_for_diffusion();
+        let decay = self.decay_rate;
 
         self.temps
             .par_iter_mut()
             .zip(channel_bufs.into_par_iter())
             .for_each(|(temp, (read, write))| {
                 h_pass(read, temp, obs);
-                v_pass(temp, write, obs);
+                v_pass(temp, write, obs, decay);
             });
 
         grid.swap_pheromone_buffers();
+        // Limpiar write_buf tras el swap para que no acumule datos del ciclo anterior.
+        // Garantiza que las emisiones del siguiente tick partan desde cero.
+        grid.clear_write_buf();
     }
 }
 
@@ -85,7 +92,7 @@ fn h_pass(src: &[f32], dst: &mut [f32], obstacles: &[bool]) {
 
 /// Convolución vertical con kernel [0.25, 0.5, 0.25] + decaimiento.
 /// Normaliza por el peso total de vecinos válidos (absorción en bordes).
-fn v_pass(src: &[f32], dst: &mut [f32], obstacles: &[bool]) {
+fn v_pass(src: &[f32], dst: &mut [f32], obstacles: &[bool], decay_rate: f32) {
     dst.par_chunks_mut(GRID_W).enumerate().for_each(|(y, row_out)| {
         for x in 0..GRID_W {
             let idx = y * GRID_W + x;
@@ -108,7 +115,7 @@ fn v_pass(src: &[f32], dst: &mut [f32], obstacles: &[bool]) {
                 w_total += KERNEL[i];
             }
             let val = if w_total > 0.0 { sum / w_total } else { 0.0 };
-            row_out[x] = (val * (1.0 - DECAY_RATE)).min(1.0);
+            row_out[x] = (val * (1.0 - decay_rate)).min(1.0);
         }
     });
 }
@@ -143,7 +150,7 @@ mod tests {
         let mut grid = SpatialGrid::new();
         let mut sys = DiffusionSystem::new();
         grid.add_pheromone(50, 50, PheromoneKind::Alarm, 1.0);
-        grid.swap_pheromone_buffers(); // mueve emisión al read_buf
+        grid.merge_emissions_into_stable(); // incorpora emisión al estado estable
         sys.step(&mut grid);
         assert!(grid.pheromone(49, 50, PheromoneKind::Alarm) > 0.0);
         assert!(grid.pheromone(51, 50, PheromoneKind::Alarm) > 0.0);
@@ -156,7 +163,7 @@ mod tests {
         let mut grid = SpatialGrid::new();
         let mut sys = DiffusionSystem::new();
         grid.add_pheromone(50, 50, PheromoneKind::Task, 1.0);
-        grid.swap_pheromone_buffers();
+        grid.merge_emissions_into_stable();
         for _ in 0..200 {
             sys.step(&mut grid);
         }
@@ -176,7 +183,7 @@ mod tests {
         let mut grid = SpatialGrid::new();
         let mut sys = DiffusionSystem::new();
         grid.add_pheromone(10, 10, PheromoneKind::Attraction, 1.0);
-        grid.swap_pheromone_buffers();
+        grid.merge_emissions_into_stable();
         for _ in 0..50 {
             sys.step(&mut grid);
         }
@@ -203,7 +210,7 @@ mod tests {
         grid.add_pheromone(30, 30, PheromoneKind::Alarm, 1.0);
         grid.add_pheromone(50, 50, PheromoneKind::Task, 1.0);
         grid.add_pheromone(70, 70, PheromoneKind::Attraction, 1.0);
-        grid.swap_pheromone_buffers();
+        grid.merge_emissions_into_stable();
 
         for _ in 0..10 {
             sys.step(&mut grid);
@@ -238,7 +245,7 @@ mod tests {
         let mut grid = SpatialGrid::new();
         let mut sys = DiffusionSystem::new();
         grid.add_pheromone(50, 50, PheromoneKind::Alarm, 1.0);
-        grid.swap_pheromone_buffers();
+        grid.merge_emissions_into_stable();
 
         // Pasos 1-50: blob en expansión → entropía en su máximo
         for _ in 0..50 {

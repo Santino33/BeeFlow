@@ -22,6 +22,28 @@ pub struct AgentRenderData {
     pub role: AgentKind,
 }
 
+/// Comandos enviados desde la UI al Orchestrator para modificar parámetros en tiempo real.
+pub enum SimCommand {
+    /// Override manual de temperatura en °C. `f32::NAN` = volver al ciclo estacional.
+    SetTemperature(f32),
+    /// Salto directo de `season_phase` [0.0, 1.0).
+    SetSeason(f32),
+    /// Presión de pesticidas [0.0, 1.0].
+    SetPesticide(f32),
+    SetDiseaseEnabled(bool),
+    SetDiseaseRate(f32),
+    /// Velocidad de simulación en ticks/seg.
+    SetSimulationSpeed(u32),
+    /// Costo metabólico basal por tick [0.001, 0.05].
+    SetMetabolicRate(f32),
+    /// Umbral de reserva para activar trofalaxia [10, 50].
+    SetTrophallaxisThreshold(f32),
+    /// Tasa de decaimiento de feromonas por tick [0.01, 0.15].
+    SetPheromoneDecay(f32),
+    /// Multiplicador de intensidad de emisión de feromonas [0.1, 2.0].
+    SetPheromoneEmission(f32),
+}
+
 /// Frame completo enviado del thread de simulación al renderer por mpsc.
 pub struct RenderFrame {
     pub tick: u64,
@@ -41,7 +63,7 @@ use eframe::egui;
 #[cfg(feature = "visualizer")]
 use std::collections::VecDeque;
 #[cfg(feature = "visualizer")]
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 #[cfg(feature = "visualizer")]
 use std::time::Instant;
 
@@ -56,6 +78,40 @@ use std::time::Instant;
 #[cfg(feature = "visualizer")] const BLUE_M:    egui::Color32 = egui::Color32::from_rgb(74,  144, 217);
 #[cfg(feature = "visualizer")] const TEXT_PRI:  egui::Color32 = egui::Color32::from_rgb(222, 222, 222);
 #[cfg(feature = "visualizer")] const TEXT_SEC:  egui::Color32 = egui::Color32::from_rgb(140, 140, 140);
+
+/// Cache local de valores de los controles del panel derecho.
+/// Se sincroniza con el Orchestrator via `SimCommand`.
+#[cfg(feature = "visualizer")]
+struct UiParams {
+    temperature:            f32,   // °C
+    temp_manual:            bool,  // false = Auto (sigue estación)
+    pesticide:              f32,   // [0.0, 1.0]
+    disease_enabled:        bool,
+    disease_rate:           f32,   // [0.01, 0.20]
+    metabolic_rate:         f32,   // [0.001, 0.05]
+    trophallaxis_threshold: f32,   // [10.0, 50.0]
+    pheromone_decay:        f32,   // [0.01, 0.15]
+    pheromone_emission:     f32,   // [0.1, 2.0]
+    speed:                  u32,   // ticks/seg
+}
+
+#[cfg(feature = "visualizer")]
+impl Default for UiParams {
+    fn default() -> Self {
+        Self {
+            temperature:            20.0,
+            temp_manual:            false,
+            pesticide:              0.0,
+            disease_enabled:        false,
+            disease_rate:           0.05,
+            metabolic_rate:         0.001,
+            trophallaxis_threshold: 20.0,
+            pheromone_decay:        0.05,
+            pheromone_emission:     1.0,
+            speed:                  30,
+        }
+    }
+}
 
 #[cfg(feature = "visualizer")]
 #[derive(PartialEq, Clone, Copy)]
@@ -85,11 +141,17 @@ pub struct VisualizerApp {
     selected_channel:  PheromoneChannel,
     texture:           Option<egui::TextureHandle>,
     metrics_history:   VecDeque<MetricsSnapshot>,
+    cmd_tx:            Option<Sender<SimCommand>>,
+    ui_params:         UiParams,
 }
 
 #[cfg(feature = "visualizer")]
 impl VisualizerApp {
-    pub fn new(rx: Receiver<RenderFrame>, tick_duration: std::time::Duration) -> Self {
+    pub fn new(
+        rx: Receiver<RenderFrame>,
+        tick_duration: std::time::Duration,
+        cmd_tx: Option<Sender<SimCommand>>,
+    ) -> Self {
         Self {
             rx,
             current:           None,
@@ -99,6 +161,14 @@ impl VisualizerApp {
             selected_channel:  PheromoneChannel::Attraction,
             texture:           None,
             metrics_history:   VecDeque::with_capacity(60),
+            cmd_tx,
+            ui_params:         UiParams::default(),
+        }
+    }
+
+    fn send_cmd(&self, cmd: SimCommand) {
+        if let Some(tx) = &self.cmd_tx {
+            let _ = tx.send(cmd);
         }
     }
 
@@ -200,11 +270,20 @@ impl VisualizerApp {
             ui.add(egui::Separator::default().vertical());
             ui.add_space(6.0);
 
-            // Selector de velocidad (solo visual)
-            for label in ["×1", "×5", "×30", "×100"] {
-                ui.add(egui::Button::new(
-                    egui::RichText::new(label).size(11.0).color(TEXT_SEC)
-                ).fill(SURFACE_3).min_size(egui::vec2(34.0, 22.0)));
+            // Selector de velocidad (funcional)
+            for (label, speed) in [("×1", 1u32), ("×5", 5), ("×30", 30), ("×100", 100)] {
+                let active = self.ui_params.speed == speed;
+                let (fill, text_col) = if active {
+                    (egui::Color32::from_rgb(60, 44, 8), AMBER)
+                } else {
+                    (SURFACE_3, TEXT_SEC)
+                };
+                if ui.add(egui::Button::new(
+                    egui::RichText::new(label).size(11.0).color(text_col)
+                ).fill(fill).min_size(egui::vec2(34.0, 22.0))).clicked() {
+                    self.ui_params.speed = speed;
+                    self.send_cmd(SimCommand::SetSimulationSpeed(speed));
+                }
                 ui.add_space(2.0);
             }
 
@@ -358,55 +437,168 @@ impl VisualizerApp {
     // ── Panel derecho ─────────────────────────────────────────────────────────
     fn draw_right_panel(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // Selector de canal de feromonas
+
+            // ── Canal de feromonas ────────────────────────────────────────
             ui.label(egui::RichText::new("CANAL DE FEROMONAS").size(10.0).color(TEXT_SEC));
             ui.add_space(6.0);
-
             let w = ui.available_width();
             for ch in [PheromoneChannel::Alarm, PheromoneChannel::Task, PheromoneChannel::Attraction] {
                 let selected = self.selected_channel == ch;
                 let fill = if selected {
                     egui::Color32::from_rgba_premultiplied(
-                        ch.color().r() / 5, ch.color().g() / 5, ch.color().b() / 5, 255
+                        ch.color().r() / 5, ch.color().g() / 5, ch.color().b() / 5, 255,
                     )
                 } else { SURFACE_3 };
                 let text_color = if selected { ch.color() } else { TEXT_SEC };
                 if ui.add(
-                    egui::Button::new(
-                        egui::RichText::new(ch.label()).size(12.0).color(text_color)
-                    ).fill(fill).min_size(egui::vec2(w, 30.0))
+                    egui::Button::new(egui::RichText::new(ch.label()).size(12.0).color(text_color))
+                        .fill(fill).min_size(egui::vec2(w, 28.0))
                 ).clicked() {
                     self.selected_channel = ch;
                 }
                 ui.add_space(3.0);
             }
 
-            ui.add_space(12.0);
+            ui.add_space(10.0);
             ui.add(egui::Separator::default());
             ui.add_space(8.0);
 
-            // Ambiente (solo lectura)
-            ui.label(egui::RichText::new("AMBIENTE").size(10.0).color(TEXT_SEC));
+            // ── Entorno ───────────────────────────────────────────────────
+            egui::CollapsingHeader::new(
+                egui::RichText::new("ENTORNO").size(10.0).color(TEXT_SEC)
+            ).default_open(true).show(ui, |ui| {
+                // Temperatura: checkbox Manual + slider
+                let changed = ui.checkbox(
+                    &mut self.ui_params.temp_manual,
+                    egui::RichText::new("Temp. manual").size(11.0).color(TEXT_PRI)
+                ).changed();
+                if changed {
+                    let cmd = if self.ui_params.temp_manual {
+                        SimCommand::SetTemperature(self.ui_params.temperature)
+                    } else {
+                        SimCommand::SetTemperature(f32::NAN)
+                    };
+                    self.send_cmd(cmd);
+                }
+                ui.add_enabled_ui(self.ui_params.temp_manual, |ui| {
+                    if ui.add(
+                        egui::Slider::new(&mut self.ui_params.temperature, -10.0f32..=45.0)
+                            .suffix(" °C")
+                            .fixed_decimals(1)
+                    ).changed() {
+                        self.send_cmd(SimCommand::SetTemperature(self.ui_params.temperature));
+                    }
+                });
+                ui.add_space(4.0);
+
+                // Estación: 4 botones de salto
+                ui.label(egui::RichText::new("Estación").size(10.0).color(TEXT_SEC));
+                ui.horizontal(|ui| {
+                    for (label, phase) in [("Inv", 0.0f32), ("Prim", 0.25), ("Ver", 0.5), ("Otoño", 0.75)] {
+                        if ui.add(
+                            egui::Button::new(egui::RichText::new(label).size(10.0).color(TEXT_PRI))
+                                .fill(SURFACE_3).min_size(egui::vec2(44.0, 20.0))
+                        ).clicked() {
+                            self.send_cmd(SimCommand::SetSeason(phase));
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+
+                // Pesticida
+                ui.label(egui::RichText::new("Pesticida").size(10.0).color(TEXT_SEC));
+                if ui.add(
+                    egui::Slider::new(&mut self.ui_params.pesticide, 0.0f32..=1.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                ).changed() {
+                    self.send_cmd(SimCommand::SetPesticide(self.ui_params.pesticide));
+                }
+            });
+
             ui.add_space(6.0);
 
+            // ── Enfermedad ────────────────────────────────────────────────
+            egui::CollapsingHeader::new(
+                egui::RichText::new("ENFERMEDAD").size(10.0).color(TEXT_SEC)
+            ).default_open(true).show(ui, |ui| {
+                if ui.checkbox(
+                    &mut self.ui_params.disease_enabled,
+                    egui::RichText::new("SIR activo").size(11.0).color(TEXT_PRI)
+                ).changed() {
+                    self.send_cmd(SimCommand::SetDiseaseEnabled(self.ui_params.disease_enabled));
+                }
+                if self.ui_params.disease_enabled {
+                    ui.label(egui::RichText::new("Tasa infección").size(10.0).color(TEXT_SEC));
+                    if ui.add(
+                        egui::Slider::new(&mut self.ui_params.disease_rate, 0.01f32..=0.20)
+                            .fixed_decimals(3)
+                    ).changed() {
+                        self.send_cmd(SimCommand::SetDiseaseRate(self.ui_params.disease_rate));
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+
+            // ── Colonia (avanzado) ─────────────────────────────────────────
+            egui::CollapsingHeader::new(
+                egui::RichText::new("COLONIA (avanzado)").size(10.0).color(TEXT_SEC)
+            ).default_open(false).show(ui, |ui| {
+                ui.label(egui::RichText::new("Tasa metabólica").size(10.0).color(TEXT_SEC));
+                if ui.add(
+                    egui::Slider::new(&mut self.ui_params.metabolic_rate, 0.001f32..=0.05)
+                        .fixed_decimals(4)
+                ).changed() {
+                    self.send_cmd(SimCommand::SetMetabolicRate(self.ui_params.metabolic_rate));
+                }
+                ui.add_space(4.0);
+
+                ui.label(egui::RichText::new("Umbral trofalaxia").size(10.0).color(TEXT_SEC));
+                if ui.add(
+                    egui::Slider::new(&mut self.ui_params.trophallaxis_threshold, 10.0f32..=50.0)
+                        .fixed_decimals(1)
+                ).changed() {
+                    self.send_cmd(SimCommand::SetTrophallaxisThreshold(self.ui_params.trophallaxis_threshold));
+                }
+            });
+
+            ui.add_space(6.0);
+
+            // ── Feromonas ─────────────────────────────────────────────────
+            egui::CollapsingHeader::new(
+                egui::RichText::new("FEROMONAS").size(10.0).color(TEXT_SEC)
+            ).default_open(false).show(ui, |ui| {
+                ui.label(egui::RichText::new("Decaimiento").size(10.0).color(TEXT_SEC));
+                if ui.add(
+                    egui::Slider::new(&mut self.ui_params.pheromone_decay, 0.01f32..=0.15)
+                        .fixed_decimals(3)
+                ).changed() {
+                    self.send_cmd(SimCommand::SetPheromoneDecay(self.ui_params.pheromone_decay));
+                }
+                ui.add_space(4.0);
+
+                ui.label(egui::RichText::new("Intensidad emisión").size(10.0).color(TEXT_SEC));
+                if ui.add(
+                    egui::Slider::new(&mut self.ui_params.pheromone_emission, 0.1f32..=2.0)
+                        .suffix("×")
+                        .fixed_decimals(2)
+                ).changed() {
+                    self.send_cmd(SimCommand::SetPheromoneEmission(self.ui_params.pheromone_emission));
+                }
+            });
+
+            // Stats de solo lectura al fondo
             if let Some(frame) = &self.current {
                 let m = &frame.metrics;
-                stat_row(ui, "Temperatura",  &format!("{:.1} °C", m.global_temp));
-                stat_row(ui, "Estación",     &format!("{:.3}",    m.season_phase));
-                stat_row(ui, "Tasa cría",    &format!("{:.4}",    m.brood_production_rate));
-                stat_row(ui, "Cría/adultos", &format!("{:.3}",    m.brood_adult_ratio));
-
                 ui.add_space(10.0);
                 ui.add(egui::Separator::default());
-                ui.add_space(8.0);
-
-                ui.label(egui::RichText::new("COLONIA").size(10.0).color(TEXT_SEC));
                 ui.add_space(6.0);
-                stat_row(ui, "Reserva miel",  &format!("{:.3}", m.colony_reserve));
-                stat_row(ui, "Ef. forrajeo",  &format!("{:.3}", m.foraging_efficiency));
-                stat_row(ui, "Entropía fen.", &format!("{:.3}", m.pheromone_entropy));
-            } else {
-                ui.label(egui::RichText::new("Sin datos…").size(12.0).color(TEXT_SEC));
+                ui.label(egui::RichText::new("ESTADO ACTUAL").size(10.0).color(TEXT_SEC));
+                ui.add_space(4.0);
+                stat_row(ui, "Temp. efectiva", &format!("{:.1} °C", m.global_temp));
+                stat_row(ui, "Estación",        &format!("{:.3}",    m.season_phase));
+                stat_row(ui, "Tasa cría",       &format!("{:.4}",    m.brood_production_rate));
+                stat_row(ui, "Entropía fen.",   &format!("{:.3}",    m.pheromone_entropy));
             }
         });
     }

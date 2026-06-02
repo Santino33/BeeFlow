@@ -101,20 +101,16 @@ impl MetricsExporter {
 ///
 /// `H = -Σ p(x,y) log p(x,y)` donde p es la concentración normalizada por canal.
 /// Promedia sobre los canales con suma > 0; retorna 0.0 si no hay feromona alguna.
-/// Entropía de Shannon espacial sobre los 3 canales de feromona. simulation_spec.md §Métricas.
-///
-/// Lee del write buffer (emisiones frescas del tick actual: `add_pheromone` escribe ahí).
-/// El write buffer contiene difusión del tick anterior + emisiones frescas de este tick.
-/// `H = -Σ p(x,y) log p(x,y)` donde p es la concentración normalizada por canal.
-/// Promedia sobre los canales con suma > 0; retorna 0.0 si no hay feromona alguna.
+/// Lee del read_buf (estado estable post-difusión): contiene el estado difundido del tick actual
+/// incluyendo las emisiones del tick una vez incorporadas por `merge_emissions_into_stable`.
 pub fn pheromone_entropy(grid: &SpatialGrid) -> f32 {
     let channels = [PheromoneKind::Alarm, PheromoneKind::Task, PheromoneKind::Attraction];
     let mut total_h = 0.0_f32;
     let mut active = 0u32;
 
     for kind in channels {
-        // Leer del write buffer: captura emisiones frescas de este tick
-        let slice = grid.pheromone_write_slice(kind);
+        // Leer del read_buf: estado estable actualizado con emisiones + difusión de este tick
+        let slice = grid.pheromone_read_slice(kind);
         let sum: f32 = slice.iter().sum();
         if sum < 1e-9 {
             continue;

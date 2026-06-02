@@ -164,6 +164,32 @@ impl SpatialGrid {
         self.read_buf ^= 1;
     }
 
+    /// Incorpora las emisiones frescas del write_buf al estado estable (read_buf)
+    /// y limpia write_buf. Debe llamarse justo antes de cada paso de difusión para
+    /// que las emisiones del tick actual sean visibles y difundidas correctamente.
+    pub fn merge_emissions_into_stable(&mut self) {
+        let w = 1 - self.read_buf;
+        let r = self.read_buf;
+        for c in 0..PHEROMONE_CHANNELS {
+            for i in 0..TOTAL_CELLS {
+                self.phero[c][r][i] = (self.phero[c][r][i] + self.phero[c][w][i]).min(1.0);
+                self.phero[c][w][i] = 0.0;
+            }
+        }
+    }
+
+    /// Limpia el write_buf (pone a 0 todos los canales).
+    /// Llamado por DiffusionSystem después del swap para que el write_buf quede listo
+    /// para las emisiones del siguiente tick sin acumular datos del estado anterior.
+    pub fn clear_write_buf(&mut self) {
+        let w = 1 - self.read_buf;
+        for c in 0..PHEROMONE_CHANNELS {
+            for v in &mut self.phero[c][w] {
+                *v = 0.0;
+            }
+        }
+    }
+
     /// Acceso de solo lectura al buffer activo para un canal (usado por M2 para difusión).
     #[inline]
     pub fn pheromone_read_slice(&self, kind: PheromoneKind) -> &[f32] {

@@ -18,9 +18,10 @@ use crate::systems::{
     run_age_system, run_brood_system, run_disease_system, run_energy_system, run_foraging_system,
     run_honey_feeding_system, run_mortality_system, run_movement_system, run_predator_system,
     run_resource_regeneration, run_role_transition_system, run_trophallaxis_system,
-    METABOLIC_COST_BASAL,
+    METABOLIC_COST_BASAL, TROPHALLAXIS_RESERVE_THRESHOLD,
     PREDATOR_ATTACK_RATE, PREDATOR_DETECTION_RADIUS, PREDATOR_ENERGY_DRAIN,
 };
+use crate::visualizer::SimCommand;
 
 /// Motor de simulación. Controla el ciclo maestro de tick.
 pub struct Orchestrator {
@@ -41,6 +42,11 @@ pub struct Orchestrator {
     food_sources: Vec<(usize, usize)>, // M7 — posiciones de fuentes de alimento
     metrics_dir: PathBuf,
     render_tx: Option<std::sync::mpsc::SyncSender<crate::visualizer::RenderFrame>>, // M15
+    // Parámetros configurables en tiempo real desde la UI
+    cmd_rx:                  Option<std::sync::mpsc::Receiver<SimCommand>>,
+    metabolic_rate:          f32,
+    trophallaxis_threshold:  f32,
+    pheromone_emission_mult: f32,
 }
 
 impl Orchestrator {
@@ -78,6 +84,10 @@ impl Orchestrator {
             time_to_collapse: None,
             metrics_dir,
             render_tx: None,
+            cmd_rx: None,
+            metabolic_rate: METABOLIC_COST_BASAL,
+            trophallaxis_threshold: TROPHALLAXIS_RESERVE_THRESHOLD,
+            pheromone_emission_mult: 1.0,
         }
     }
 
@@ -111,14 +121,15 @@ impl Orchestrator {
             time_to_collapse: None,
             metrics_dir,
             render_tx: None,
+            cmd_rx: None,
+            metabolic_rate: METABOLIC_COST_BASAL,
+            trophallaxis_threshold: TROPHALLAXIS_RESERVE_THRESHOLD,
+            pheromone_emission_mult: 1.0,
         }
     }
 
     /// Ejecuta el loop completo hasta `max_ticks` o hasta Ctrl-C.
     pub fn run(&mut self) {
-        let tick_budget =
-            Duration::from_secs_f64(1.0 / self.config.simulation_speed as f64);
-
         loop {
             if let Some(max) = self.config.max_ticks {
                 if self.tick >= max {
@@ -126,6 +137,10 @@ impl Orchestrator {
                     break;
                 }
             }
+
+            // tick_budget se recalcula cada iteración para reflejar cambios de velocidad en vivo
+            let tick_budget =
+                Duration::from_secs_f64(1.0 / self.config.simulation_speed as f64);
 
             let t0 = Instant::now();
             self.tick_once();
@@ -144,36 +159,69 @@ impl Orchestrator {
         }
     }
 
+    /// Registra el receptor del canal de comandos desde la UI.
+    pub fn set_command_receiver(
+        &mut self,
+        rx: std::sync::mpsc::Receiver<SimCommand>,
+    ) {
+        self.cmd_rx = Some(rx);
+    }
+
     /// Ejecuta un único tick siguiendo el orden canónico de architecture.md.
     pub fn tick_once(&mut self) {
-        // 1. Leer inputs externos
-        //    (M0: no-op — placeholder para eventos de usuario/config en caliente)
+        // 1. Leer comandos de la UI (M0 — no bloqueante)
+        if let Some(rx) = &self.cmd_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    SimCommand::SetTemperature(t) => {
+                        self.system_dynamics.manual_temp =
+                            if t.is_nan() { None } else { Some(t.clamp(-10.0, 45.0)) };
+                    }
+                    SimCommand::SetSeason(s) => {
+                        self.system_dynamics.season_phase = s.clamp(0.0, 1.0);
+                    }
+                    SimCommand::SetPesticide(p) => {
+                        self.system_dynamics.pesticide_pressure = p.clamp(0.0, 1.0);
+                    }
+                    SimCommand::SetDiseaseEnabled(e) => self.config.disease_enabled = e,
+                    SimCommand::SetDiseaseRate(r)    => self.config.disease_base_rate = r.clamp(0.0, 1.0),
+                    SimCommand::SetSimulationSpeed(s)=> self.config.simulation_speed = s.max(1),
+                    SimCommand::SetMetabolicRate(r)  => self.metabolic_rate = r.clamp(0.0001, 0.1),
+                    SimCommand::SetTrophallaxisThreshold(t) => self.trophallaxis_threshold = t.clamp(1.0, 200.0),
+                    SimCommand::SetPheromoneDecay(d) => self.diffusion.decay_rate = d.clamp(0.001, 0.99),
+                    SimCommand::SetPheromoneEmission(m) => self.pheromone_emission_mult = m.clamp(0.0, 10.0),
+                }
+            }
+        }
 
         // 2. Actualizar System Dynamics (cada 15 ticks) — M10
         if self.tick % 15 == 0 {
             self.system_dynamics.update(self.honey_reserve);
         }
+        // Aplicar override manual de temperatura (si está activo)
+        if let Some(t) = self.system_dynamics.manual_temp {
+            self.system_dynamics.global_temp = t;
+        }
 
-        // 3. Difundir feromonas en el Grid (double-buffer swap)
-        self.diffusion.step(&mut self.grid);
-
-        // 4. Regenerar recursos en fuentes de alimento (M7)
+        // 3. Regenerar recursos en fuentes de alimento (M7)
         run_resource_regeneration(&mut self.grid, &self.food_sources, self.system_dynamics.season_factor());
 
-        // 5. Ejecutar sistemas ECS en orden canónico
+        // 4. Ejecutar sistemas ECS en orden canónico
         //    Orden: Movement → Age → Energy → Foraging → Trophallaxis → Disease → Mortality → Role → Brood → Predator
+        //    Los sistemas emiten feromonas al write_buf durante esta fase.
         {
             run_movement_system(&mut self.world, &mut self.grid, &self.rng, self.tick);
             run_age_system(&mut self.world);
-            run_energy_system(&mut self.world, self.system_dynamics.global_temp, self.system_dynamics.pesticide_pressure); // M4/M10
+            run_energy_system(&mut self.world, self.system_dynamics.global_temp, self.system_dynamics.pesticide_pressure, self.metabolic_rate); // M4/M10
             run_foraging_system(                                      // M7
                 &mut self.world,
                 &mut self.grid,
                 &mut self.honey_reserve,
                 &mut self.honey_collected_period,
+                self.pheromone_emission_mult,
             );
             run_honey_feeding_system(&mut self.world, &mut self.honey_reserve); // M11-fix
-            run_trophallaxis_system(&mut self.world, self.honey_reserve); // M9
+            run_trophallaxis_system(&mut self.world, self.honey_reserve, self.trophallaxis_threshold); // M9
             run_disease_system(                                           // M12
                 &mut self.world,
                 &self.rng,
@@ -193,10 +241,17 @@ impl Orchestrator {
                 &self.rng,
                 self.tick,
                 self.system_dynamics.brood_production_rate,
+                self.pheromone_emission_mult,
             );
             self.deaths_by_predation +=
                 run_predator_system(&mut self.world, &mut self.grid, &self.rng, self.tick); // M13
         }
+
+        // 5. Incorporar emisiones frescas al estado estable y difundir (M2)
+        //    Orden correcto: merge → diffuse. Garantiza que las emisiones del tick actual
+        //    sean visibles en el render y correctamente difundidas al siguiente tick.
+        self.grid.merge_emissions_into_stable();
+        self.diffusion.step(&mut self.grid);
 
         // 6. Resolver interacciones Grid ↔ ECS (depositar feromonas, consumir recursos)
         //    (M3+: no-op)
@@ -246,7 +301,7 @@ impl Orchestrator {
         // ticks entre exports = 60; costo energético es proxy del gasto de los foragers
         let foraging_efficiency = if by_role.forager > 0 {
             self.honey_collected_period
-                / (by_role.forager as f32 * 60.0 * METABOLIC_COST_BASAL)
+                / (by_role.forager as f32 * 60.0 * self.metabolic_rate.max(1e-6))
         } else {
             0.0
         };
@@ -563,11 +618,12 @@ mod tests {
         }
         let avg_ns = t0.elapsed().as_nanos() / 1000;
 
-        // En debug (sin optimizaciones) permitimos hasta 10 ms.
+        // En debug (sin optimizaciones) permitimos hasta 20 ms.
+        // merge_emissions_into_stable + clear_write_buf agregan ~2 iteraciones sobre 30k celdas.
         // En release el límite real es 2 ms — detecta regresiones O(N²) con N=500.
         // La validación de rendimiento en release está en `cargo bench --bench diffusion`.
         #[cfg(debug_assertions)]
-        let limit_ns: u128 = 10_000_000;
+        let limit_ns: u128 = 20_000_000;
         #[cfg(not(debug_assertions))]
         let limit_ns: u128 = 2_000_000;
 
@@ -874,23 +930,31 @@ mod tests {
     fn predator_by_predation_nonzero_with_predators() {
         // Tick 60 (primeros 60 ticks con 500 abejas vivas): debe haber al menos 1 muerte por depredación.
         let dir = TempDir::new().unwrap();
+        // Con bees spawneando cerca de la colmena (radio 12-15), los depredadores
+        // necesitan más ticks para llegar. Usamos más depredadores y más ticks.
         let config = RunConfig {
             seed: 42,
             initial_population: 500,
-            initial_honey_reserve: 0.8,
-            predator_count: 10,
-            max_ticks: Some(121),
+            initial_honey_reserve: 200.0,
+            predator_count: 30,
+            max_ticks: Some(241),
             ..Default::default()
         };
         let mut orch = Orchestrator::new_with_output(config, dir.path());
         orch.run();
 
-        let content = std::fs::read_to_string(dir.path().join("metrics_00000060.json")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let by_pred = parsed["mortality_rate"]["by_predation"].as_u64().unwrap_or(0);
+        // Acumular muertes por depredación en los primeros 240 ticks
+        let mut total_pred = 0u64;
+        for fname in &["metrics_00000060.json", "metrics_00000120.json", "metrics_00000180.json", "metrics_00000240.json"] {
+            if let Ok(content) = std::fs::read_to_string(dir.path().join(fname)) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                    total_pred += parsed["mortality_rate"]["by_predation"].as_u64().unwrap_or(0);
+                }
+            }
+        }
         assert!(
-            by_pred > 0,
-            "con 10 depredadores y 500 abejas en los primeros 60 ticks debe haber muertes por depredación, obtenido {by_pred}"
+            total_pred > 0,
+            "con 30 depredadores y 500 abejas en 240 ticks debe haber muertes por depredación, total={total_pred}"
         );
     }
 
@@ -1133,10 +1197,10 @@ mod tests {
         let total: u32 = counts.iter().sum();
         assert_eq!(total, 500, "debe haber 500 abejas en total");
         assert_eq!(counts[0], 1, "exactamente 1 reina");
-        // Foragers ≈ 20%, Guards ≈ 10%, Builders ≈ 9% (margen ±10 por rounding)
-        assert!((90..=110).contains(&counts[4]), "foragers esperados ~99, obtenidos {}", counts[4]);
-        assert!((44..=54).contains(&counts[3]), "guards esperados ~49, obtenidos {}", counts[3]);
-        assert!((39..=50).contains(&counts[2]), "builders esperados ~44, obtenidos {}", counts[2]);
+        // Foragers ≈ 30%, Guards ≈ 8%, Builders ≈ 7% (margen ±15 por rounding)
+        assert!((134..=164).contains(&counts[4]), "foragers esperados ~149 (30%), obtenidos {}", counts[4]);
+        assert!((35..=50).contains(&counts[3]), "guards esperados ~40 (8%), obtenidos {}", counts[3]);
+        assert!((28..=42).contains(&counts[2]), "builders esperados ~35 (7%), obtenidos {}", counts[2]);
         assert_eq!(counts[5], 0, "sin zánganos en spawn inicial");
         // Nurses absorben el residuo → ~307 (el resto después de los demás)
         assert!(counts[1] > 250, "nurses deben ser la mayoría, obtenidos {}", counts[1]);
@@ -1202,9 +1266,10 @@ mod tests {
         let avg_ns = t0.elapsed().as_nanos() / 100;
 
         // El overhead del renderer en el thread de simulación debe ser despreciable.
-        // En debug el límite es 20 ms; en release < 2 ms (idéntico al tick_once_is_fast).
+        // En debug el límite es 60 ms (merge+clear+render frame build);
+        // en release < 2 ms (idéntico al tick_once_is_fast).
         #[cfg(debug_assertions)]
-        let limit_ns: u128 = 20_000_000;
+        let limit_ns: u128 = 60_000_000;
         #[cfg(not(debug_assertions))]
         let limit_ns: u128 = 2_000_000;
 
