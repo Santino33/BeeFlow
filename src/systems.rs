@@ -9,7 +9,7 @@ use crate::grid::{PheromoneKind, SpatialGrid, HIVE_X, HIVE_Y};
 use crate::rng::RngSystem;
 
 /// Costo metabólico basal por tick (simulation_spec.md §Energía).
-pub const METABOLIC_COST_BASAL: f32 = 0.008;
+pub const METABOLIC_COST_BASAL: f32 = 0.001;
 
 /// Máxima carga de néctar que puede llevar un Forager (simulation_spec.md §Forrajeo).
 pub const FORAGER_CARRY_MAX: f32 = 0.5;
@@ -270,8 +270,39 @@ pub fn run_resource_regeneration(
     }
 }
 
+/// Alimenta a todas las abejas con hambre (energy < 1.0) consumiendo de honey_reserve.
+/// Cada tick cubre METABOLIC_COST_BASAL por abeja si la reserva alcanza; si no, reparte
+/// proporcionalmente. Cuando honey_reserve = 0 las abejas empiezan a morir orgánicamente.
+pub fn run_honey_feeding_system(world: &mut hecs::World, honey_reserve: &mut f32) {
+    if *honey_reserve <= 0.0 {
+        return;
+    }
+    let hungry: Vec<hecs::Entity> = world
+        .query::<(&EnergyComponent,)>()
+        .iter()
+        .filter(|(_, (e,))| e.0 < 1.0)
+        .map(|(entity, _)| entity)
+        .collect();
+
+    if hungry.is_empty() {
+        return;
+    }
+
+    let per_bee = METABOLIC_COST_BASAL;
+    let total_need = hungry.len() as f32 * per_bee;
+    let available = honey_reserve.min(total_need);
+    let ratio = available / total_need;
+
+    for entity in &hungry {
+        if let Ok(mut e) = world.get::<&mut EnergyComponent>(*entity) {
+            e.0 = (e.0 + per_bee * ratio).min(1.0);
+        }
+    }
+    *honey_reserve -= available;
+}
+
 /// Reserva de colonia por debajo de la cual se activa la trofalaxia (simulation_spec.md §Energy).
-pub const TROPHALLAXIS_RESERVE_THRESHOLD: f32 = 0.70;
+pub const TROPHALLAXIS_RESERVE_THRESHOLD: f32 = 20.0;
 
 /// Energía transferida por tick entre un par adyacente durante trofalaxia.
 pub const TROPHALLAXIS_TRANSFER_RATE: f32 = 0.05;

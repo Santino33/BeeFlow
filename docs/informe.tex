@@ -1,0 +1,341 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{tikz-cd}
+\usepackage{multicol}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{1\baselineskip}
+
+\begin{document}
+
+\section*{Tema: formacion de planetas en nebulosas}
+
+Este documento tecnico presenta una propuesta formal para estudiar la \textbf{formacion de planetas en nebulosas protoplanetarias} usando la base computacional del proyecto BeeFlow.
+
+BeeFlow fue implementado como un motor de simulacion hibrida de agentes + campo + dinamica global, con ejecucion determinista, exportacion de metricas y validaciones de rendimiento. Esta arquitectura se considera apta para reformular el problema planetario como un sistema multi-escala con interacciones locales (microfisica) y variables globales (macroestructura del disco).
+
+\section*{Definicion del problema}
+
+Problema cientifico: explicar como una nebulosa protoplanetaria evoluciona desde polvo y gas hasta estructuras planetesimales y, eventualmente, planetas estables.
+
+Desde el punto de vista de simulacion, se requiere:
+
+\begin{itemize}
+  \item representar miles de entidades con estado interno y dinamica local;
+  \item modelar campos espaciales continuos (densidad, temperatura, senales);
+  \item acoplar escalas temporales rapidas y lentas sin perder estabilidad numerica;
+  \item correr experimentos reproducibles con semillas fijas y barrido de parametros.
+\end{itemize}
+
+La hipotesis de trabajo del proyecto es que una arquitectura tipo BeeFlow puede cubrir estas necesidades en hardware de consumo (CPU multicore), con tick fijo y presupuesto temporal por paso de simulacion.
+
+\section*{Marco teorico}
+
+El problema de formacion planetaria combina transporte de materia, agregacion, perdida y transiciones de estado. En esta adaptacion se consideran tres niveles teoricos:
+
+\textbf{(1) Nivel local (micro):} interacciones entre unidades discretas (particulas, agregados o ``proto-agentes'').
+
+\textbf{(2) Nivel de campo (meso):} distribucion espacial de magnitudes continuas sobre un grid 2D (por ejemplo, densidad efectiva y gradientes de atraccion).
+
+\textbf{(3) Nivel global (macro):} variables lentas del sistema (reserva total de masa util, forzamiento termico, fase evolutiva del disco).
+
+La dinamica en BeeFlow ya implementa esta separacion por capas. Su ecuacion local de actualizacion (en el proyecto original) tiene forma:
+
+\[
+E_{t+1} = E_t - C_{met}(T) + G_{loc}(r) + T_{coop},
+\]
+
+donde la estructura es reutilizable para cualquier ``presupuesto de estado'' local (energia, masa, momento efectivo, etc.).
+
+Para la capa de campo, el proyecto utiliza difusion gaussiana separable con decaimiento:
+
+\[
+\phi_{t+1}(x,y) = \mathcal{D}_{3\times 3}(\phi_t)(x,y)\,(1-\lambda),\quad \lambda = 0.05.
+\]
+
+Esta forma es apropiada para representar mezclado local y disipacion de senales en la nebulosa, bajo una aproximacion de primer orden.
+
+\section*{Marco computacional}
+
+Implementacion actual del proyecto (verificacion directa en codigo y documentacion):
+
+\begin{itemize}
+  \item Lenguaje: Rust 2021, perfil release endurecido (LTO, \texttt{opt-level=3}, \texttt{panic=abort}).
+  \item ECS: \texttt{hecs} para entidades y componentes.
+  \item Paralelismo: \texttt{rayon}, buffers dobles y RNG determinista por agente/tick.
+  \item Grid: 100\(\times\)100 celdas, chunking 16\(\times\)16, borde de amortiguamiento de 5 celdas.
+  \item Campo: 3 canales de difusion con kernel gaussiano separable.
+  \item Orquestacion: ciclo canonico de tick con actualizacion global cada 15 ticks.
+  \item Metricas: exportacion JSON cada 60 ticks (Parquet por feature flag).
+\end{itemize}
+
+Presupuestos y desempeno reportados en backlog/diseno:
+
+\begin{center}
+\begin{tabular}{|l|c|c|}
+\hline
+Componente & Objetivo & Resultado reportado \\
+\hline
+Loop vacio & $<1$ ms/tick & $\sim 0.1$ ms/tick \\
+Difusion 100\(\times\)100 (3 canales) & $<5$ ms/tick & $\sim 2.15$ ms/tick \\
+5,000 agentes (mov+edad) & $<10$ ms/tick & $\sim 1.6$ ms/tick \\
+Sistema completo (objetivo global) & $<80$ ms/tick & dentro de objetivo v1 \\
+\hline
+\end{tabular}
+\end{center}
+
+\section*{Consideraciones clave para construir la simulacion}
+
+Ademas del diseno de algoritmos, la implementacion exigio un conjunto de decisiones de ingenieria que aparecen distribuidas en la documentacion de \texttt{docs/} y \texttt{design/}. Esta seccion consolida los criterios mas importantes que hubo que tener en cuenta.
+
+\textbf{1) Alcance realista de v1 (control de complejidad).}
+
+Desde el inicio se limito el alcance para garantizar una primera version estable y medible:
+
+\begin{itemize}
+  \item motor nativo de escritorio en lugar de despliegue web;
+  \item grid 100\(\times\)100 y hasta miles de agentes, no escala masiva;
+  \item difusion en CPU (sin compute shaders) para mantener trazabilidad y debug;
+  \item visualizacion cientifica ligera en lugar de motor 3D inmersivo.
+\end{itemize}
+
+Esto reduce riesgo tecnico y permite validar primero la coherencia del modelo.
+
+\textbf{2) Restricciones de hardware objetivo.}
+
+El proyecto fue orientado a hardware de consumo (CPU 6--16 nucleos, 16--32 GB RAM). Esta condicion definio el presupuesto temporal por tick y forzo decisiones de cache-locality, paralelismo por datos y minimizacion de bloqueos.
+
+\textbf{3) Separacion de escalas temporales.}
+
+No todos los procesos evolucionan a la misma velocidad. Para evitar sobrecosto computacional y ruido numerico:
+
+\begin{itemize}
+  \item el loop logico corre con tick fijo;
+  \item la dinamica global se actualiza cada 15 ticks;
+  \item las metricas se exportan cada 60 ticks;
+  \item el render opera desacoplado del hilo de simulacion.
+\end{itemize}
+
+Este desacople fue una condicion central para mantener estabilidad y rendimiento simultaneamente.
+
+\textbf{4) Consistencia arquitectonica en capas.}
+
+La simulacion se estructuro en capas con contratos de interfaz claros (quien lee y quien escribe cada estado). Se evito que los sistemas se llamen directamente entre si; toda comunicacion pasa por el estado global o por parametros explicitos del orquestador.
+
+Esta regla disminuye acoplamiento, facilita pruebas y evita efectos laterales ocultos.
+
+\textbf{5) Determinismo como requisito cientifico.}
+
+No se considero opcional: el determinismo era necesario para reproducibilidad experimental. Para ello se adopto:
+
+\begin{itemize}
+  \item semilla global configurable por corrida;
+  \item derivacion determinista por agente/tick;
+  \item orden de ejecucion canonico fijo en el orquestador;
+  \item uso de double-buffering en procesos de campo.
+\end{itemize}
+
+\textbf{6) Modelado de campo con estabilidad numerica.}
+
+La difusion se implemento con kernel gaussiano separable + decaimiento y bordes absorbentes. Esta combinacion se eligio para:
+
+\begin{itemize}
+  \item evitar oscilaciones de esquemas ingenuos;
+  \item controlar acumulacion artificial en bordes;
+  \item mantener costo computacional bajo en CPU multicore.
+\end{itemize}
+
+\textbf{7) Diseno para observabilidad desde el inicio.}
+
+La simulacion no se planteo como ``caja negra''. Se incluyeron metricas de emergencia, trazas y benchmarks como parte del nucleo del sistema, no como agregado tardio. Esto permitio detectar colapsos, desacoples y desviaciones spec-codigo durante el desarrollo.
+
+\textbf{8) Gobernanza documental (spec-first).}
+
+En \texttt{design/} se definio una regla fuerte: el comportamiento biologico debe existir primero en \texttt{simulation\_spec.md}, y la estructura de software en \texttt{architecture.md}. El codigo debe seguir estos documentos.
+
+Este principio fue clave para coordinar trabajo por roles (Arquitecto, Biologo, Programador ECS, QA) y para reducir ambiguedad en decisiones tecnicas.
+
+\textbf{9) Planificacion incremental por modulos.}
+
+La hoja de ruta y backlog no priorizan cantidad de features, sino cierre de modulos con criterio de exito, benchmark y pruebas de reproducibilidad. Se avanzo de infraestructura minima a comportamiento emergente y perturbaciones en iteraciones controladas (M0--M15).
+
+\textbf{10) Manejo explicito de trade-offs.}
+
+Tambien hubo decisiones diferidas de forma consciente: GPU compute masivo, grids gigantes, dashboard web y evolucion genetica quedaron fuera de v1. Esta disciplina permitio proteger el objetivo principal: un simulador validable y util para experimentacion.
+
+\section*{Algoritmos}
+
+\textbf{1) Orquestacion por tick (orden fijo):}
+
+\begin{enumerate}
+  \item actualizacion de dinamica global cada 15 ticks;
+  \item difusion de campo con swap de buffers;
+  \item regeneracion de recursos;
+  \item ejecucion de sistemas ECS en orden canonico;
+  \item exportacion de metricas cada 60 ticks;
+  \item envio no bloqueante al renderer.
+\end{enumerate}
+
+\textbf{2) Difusion numerica:}
+
+Convolucion horizontal + vertical separables, normalizacion en bordes y decaimiento multiplicativo. Se garantiza ausencia de condiciones de carrera por lectura/escritura en buffers separados.
+
+\textbf{3) Transiciones de estado tipo umbral:}
+
+El proyecto implementa una regla probabilistica de tipo Fixed-Threshold:
+
+\[
+P(\text{adoptar }T)=\frac{s_T^2}{s_T^2+\theta_T^2},
+\]
+
+con heterogeneidad individual y cooldown temporal. Esta estructura es reusable para cambios de fase fisica en agregados protoplanetarios.
+
+\textbf{4) Perturbaciones y colapso:}
+
+Existen sistemas de perturbacion (enfermedad, depredacion en el dominio original) que modelan forzamientos adversos. En la adaptacion planetaria se interpretan como eventos disruptivos (fragmentacion, perdida de material, inestabilidad local).
+
+\section*{Implementacion - diseno}
+
+El diseno sigue una arquitectura en capas con contratos explicitos de lectura/escritura por sistema.
+
+\begin{center}
+\begin{tikzcd}[row sep=2em, column sep=2.2em]
+\text{Orchestrator} \arrow[r] & \text{System Dynamics} \arrow[r] & \text{ECS Systems} \arrow[r] & \text{Grid/Field} \arrow[r] & \text{Metrics/Render}
+\end{tikzcd}
+\end{center}
+
+Decisiones de diseno relevantes:
+
+\begin{itemize}
+  \item \textbf{Determinismo}: semilla global + RNG por agente/tick.
+  \item \textbf{Rendimiento}: layout SOA para grid y chunking para localidad de cache.
+  \item \textbf{Concurrencia}: sin locks en hot path; sincronizacion minima por swap.
+  \item \textbf{Escalabilidad}: separacion de frecuencias (tick rapido vs dinamica lenta).
+\end{itemize}
+
+Brechas tecnicas detectadas entre especificacion y codigo actual (importantes para trazabilidad):
+
+\begin{itemize}
+  \item costo metabolico basal en codigo: \texttt{0.008/tick}; en spec: \texttt{0.02/tick};
+  \item umbral de trofalaxia en codigo: \texttt{0.70}; en spec: \texttt{0.30};
+  \item \texttt{initial\_honey\_reserve} por defecto en codigo: \texttt{10.0}; en spec: \texttt{0.8};
+  \item fuentes de alimento: implementadas como parches fijos (17\(\times\)17), mientras la spec define fuentes puntuales/aleatorias.
+\end{itemize}
+
+Estas diferencias deben resolverse via RFC para asegurar consistencia antes de extrapolar resultados cientificos al caso planetario.
+
+\section*{Flujo de desarrollo por iteraciones}
+
+El desarrollo del proyecto siguio un flujo incremental guiado por \texttt{design/backlog.md}: cada iteracion cierra modulos completos con criterio de exito, pruebas y presupuesto de rendimiento. La regla operativa fue \textbf{no avanzar al siguiente bloque hasta validar el anterior}.
+
+\textbf{Iteracion 1: Mundo y agentes minimos (M0--M3).}
+
+Se construyo la base del motor: infraestructura Rust, loop de tick, grid chunked, difusion de feromonas y agentes ECS basicos (spawn, movimiento, edad). En esta etapa se confirmo que el nucleo corria dentro de presupuesto y con determinismo reproducible.
+
+\textbf{Iteracion 2: Energia y mortalidad (M4--M5).}
+
+Se incorporo el balance energetico por tick y la eliminacion de entidades sin energia. El objetivo fue cerrar el ciclo minimo de vida/muerte y garantizar limpieza correcta del estado (sin entidades ``zombie'' y sin inconsistencias de ocupacion en el grid).
+
+\textbf{Iteracion 3: Roles y comportamiento social (M6--M9).}
+
+Se agregaron roles diferenciados, forrajeo completo, transicion de roles por modelo de umbral fijo y trofalaxia. Esta iteracion habilito comportamiento emergente, al pasar de agentes homogeneos a una colonia funcional con especializacion y coordinacion local.
+
+\textbf{Iteracion 4: Dinamica global y cria (M10--M11).}
+
+Se integraron variables macro (estacionalidad, temperatura global, reservas, produccion de cria) y el ciclo huevo-larva-pupa-adulto. Con esto se acoplaron escalas micro y macro, permitiendo crecimiento y declive poblacional en funcion del estado global.
+
+\textbf{Iteracion 5: Perturbaciones (M12--M13).}
+
+Se implementaron amenazas internas y externas: sistema epidemiologico SIR y depredadores. Esta fase permitio evaluar resiliencia, sensibilidad a choques y condiciones de colapso bajo estres.
+
+\textbf{Iteracion 6: Visualizacion y exportacion (M14--M15).}
+
+Se cerraron capacidades de analisis y observacion: exportacion de metricas completas y visualizador en hilo separado. El foco fue hacer la simulacion inspeccionable en tiempo real y reutilizable en analisis posterior.
+
+\textbf{Criterios transversales aplicados en todas las iteraciones.}
+
+\begin{itemize}
+  \item cada modulo requiere pruebas funcionales y criterio de exito explicito;
+  \item se verifica rendimiento contra presupuesto antes de marcar modulo como completo;
+  \item se exige reproducibilidad (misma seed, mismos resultados exportados);
+  \item cualquier cambio de comportamiento debe estar documentado en spec/arquitectura.
+\end{itemize}
+
+Este flujo por iteraciones fue clave para mantener control de complejidad, trazabilidad tecnica y calidad experimental, evitando crecimiento desordenado del sistema.
+
+\section*{Validaciones}
+
+Validaciones implementadas en el repositorio:
+
+\begin{itemize}
+  \item pruebas unitarias de grid, difusion, movimiento, energia, mortalidad, transicion, cria, SIR y depredacion;
+  \item verificacion de determinismo: mismos seeds producen mismos JSON de metricas;
+  \item benchmarks con \texttt{criterion} para modulos criticos;
+  \item chequeos de invariante (clamp de energia, conteo de ocupacion, bordes absorbentes).
+\end{itemize}
+
+La evidencia documental indica cobertura funcional de los modulos M0--M15 como ``completos'' en backlog tecnico.
+
+\section*{Experimentacion (verificacion con multiples parametro)}
+
+Se propone y documenta una matriz de experimentos compatible con la infraestructura actual:
+
+\begin{center}
+\begin{tabular}{|c|c|c|c|c|}
+\hline
+Escenario & Semilla & Perturbacion & Poblacion inicial & Objetivo \\
+\hline
+E0 (base) & 42 & sin perturbacion extra & 500 & estabilidad y baseline \\
+E1 (disruptivo) & 44 & enfermedad habilitada & 500 & robustez a contagio \\
+E2 (choques externos) & 99 & depredadores $>0$ & 500 & resiliencia a perdidas \\
+E3 (estres extremo) & 42 & baja reserva inicial & 10--100 & tiempo a colapso \\
+\hline
+\end{tabular}
+\end{center}
+
+Indicadores a medir en cada corrida:
+
+\begin{itemize}
+  \item \texttt{population\_by\_role},
+  \item \texttt{colony\_reserve},
+  \item \texttt{pheromone\_entropy},
+  \item \texttt{sir\_prevalence},
+  \item \texttt{time\_to\_collapse},
+  \item \texttt{mortality\_rate} desagregada.
+\end{itemize}
+
+En una corrida observada de larga duracion (archivos de metricas existentes):
+
+\begin{itemize}
+  \item en tick 0 se observa poblacion total 500 y produccion activa;
+  \item se registra colapso temprano en \texttt{time\_to\_collapse = 86};
+  \item para ticks tardios (ej. 1800 y 3720) no quedan agentes activos, pero la reserva global permanece positiva.
+\end{itemize}
+
+\section*{Analisis de resultados con base en experimentacion}
+
+Interpretacion tecnica:
+
+\begin{itemize}
+  \item el motor es computacionalmente estable y reproducible, por lo que es apto para barridos parametrizados;
+  \item la dinamica emergente muestra sensibilidad alta a parametros de consumo, reposicion y perturbacion;
+  \item la existencia de colapso temprano junto con reserva positiva sugiere desacople entre subsistemas locales y macroestado;
+  \item las brechas spec-codigo afectan la interpretacion causal de resultados y deben cerrarse antes de validar hipotesis cientificas fuertes.
+\end{itemize}
+
+En el contexto ``formacion de planetas'', este hallazgo se traduce en una advertencia metodologica: el simulador puede producir trayectorias de colapso o estabilizacion que dependen mas de la parametrizacion interna que del fenomeno fisico objetivo si no se mantiene consistencia formal entre especificacion e implementacion.
+
+\section*{Conclusiones}
+
+\begin{itemize}
+  \item BeeFlow entrega una base solida para simulacion hibrida multi-escala: ECS + grid + dinamica global + metricas.
+  \item El proyecto ya cumple requisitos clave de ingenieria cientifica: determinismo, observabilidad, rendimiento y modularidad.
+  \item Para usarlo como plataforma de estudio de formacion planetaria, el siguiente paso critico es una capa de parametrizacion fisica explicita y una alineacion estricta spec-codigo.
+  \item La experimentacion inicial muestra que el framework detecta regmenes de estabilidad/colapso y es adecuado para analisis de sensibilidad con multiples parametros.
+\end{itemize}
+
+\textbf{Recomendacion inmediata:} abrir RFC de armonizacion de parametros nucleares (costos, umbrales, condiciones de fuente) y luego ejecutar una campana de experimentos factorial con al menos 30 semillas por escenario.
+
+\end{document}

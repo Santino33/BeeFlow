@@ -37,7 +37,7 @@ impl SystemDynamicsState {
         self.global_temp = Self::temp_from_phase(self.season_phase);
 
         let season_factor = self.season_factor();
-        let reserve_factor = (honey_reserve / 0.5).clamp(0.0, 1.0);
+        let reserve_factor = (honey_reserve / 20.0).clamp(0.0, 1.0);
         self.brood_production_rate = 0.1 * season_factor * reserve_factor;
     }
 

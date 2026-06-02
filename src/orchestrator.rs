@@ -16,8 +16,9 @@ use crate::metrics::{MetricsExporter, MetricsSnapshot, MortalityBreakdown, RoleD
 use crate::rng::RngSystem;
 use crate::systems::{
     run_age_system, run_brood_system, run_disease_system, run_energy_system, run_foraging_system,
-    run_mortality_system, run_movement_system, run_predator_system, run_resource_regeneration,
-    run_role_transition_system, run_trophallaxis_system, METABOLIC_COST_BASAL,
+    run_honey_feeding_system, run_mortality_system, run_movement_system, run_predator_system,
+    run_resource_regeneration, run_role_transition_system, run_trophallaxis_system,
+    METABOLIC_COST_BASAL,
     PREDATOR_ATTACK_RATE, PREDATOR_DETECTION_RADIUS, PREDATOR_ENERGY_DRAIN,
 };
 
@@ -171,6 +172,7 @@ impl Orchestrator {
                 &mut self.honey_reserve,
                 &mut self.honey_collected_period,
             );
+            run_honey_feeding_system(&mut self.world, &mut self.honey_reserve); // M11-fix
             run_trophallaxis_system(&mut self.world, self.honey_reserve); // M9
             run_disease_system(                                           // M12
                 &mut self.world,
