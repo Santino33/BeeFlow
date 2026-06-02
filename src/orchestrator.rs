@@ -9,6 +9,7 @@ use crate::components::{
 };
 use crate::config::RunConfig;
 use crate::diffusion::DiffusionSystem;
+use crate::system_dynamics::SystemDynamicsState;
 use crate::grid::{SpatialGrid, BORDER, FOOD_SOURCE_POSITIONS, GRID_W, HIVE_X, HIVE_Y};
 use crate::metrics::{MetricsExporter, MetricsSnapshot, MortalityBreakdown, RoleDistribution};
 use crate::rng::RngSystem;
@@ -27,7 +28,7 @@ pub struct Orchestrator {
     pub grid: SpatialGrid,              // M1
     diffusion: DiffusionSystem,         // M2
     pub world: hecs::World,             // M3 — entidades ECS
-    pub global_temp: f32,               // M4 — °C; actualizado por M10 (SystemDynamics)
+    pub system_dynamics: SystemDynamicsState, // M10 — variables globales y estacionalidad
     deaths_by_energy: u32,             // M5 — acumulado entre exports; reset en cada snapshot
     pub honey_reserve: f32,            // M7 — reserva global de miel
     honey_collected_period: f32,       // M7 — miel depositada desde último export
@@ -56,13 +57,13 @@ impl Orchestrator {
             honey_reserve: config.initial_honey_reserve,
             honey_collected_period: 0.0,
             food_sources,
+            system_dynamics: SystemDynamicsState::new(&config),
             config,
             rng,
             exporter,
             grid,
             diffusion: DiffusionSystem::new(),
             world,
-            global_temp: 20.0,
             deaths_by_energy: 0,
             metrics_dir,
         }
@@ -84,13 +85,13 @@ impl Orchestrator {
             honey_reserve: config.initial_honey_reserve,
             honey_collected_period: 0.0,
             food_sources,
+            system_dynamics: SystemDynamicsState::new(&config),
             config,
             rng,
             exporter,
             grid,
             diffusion: DiffusionSystem::new(),
             world,
-            global_temp: 20.0,
             deaths_by_energy: 0,
             metrics_dir,
         }
@@ -131,24 +132,23 @@ impl Orchestrator {
         // 1. Leer inputs externos
         //    (M0: no-op — placeholder para eventos de usuario/config en caliente)
 
-        // 2. Actualizar System Dynamics (cada 15 ticks)
-        //    (M10: no-op)
+        // 2. Actualizar System Dynamics (cada 15 ticks) — M10
         if self.tick % 15 == 0 {
-            // SystemDynamicsState::update(...)
+            self.system_dynamics.update(self.honey_reserve);
         }
 
         // 3. Difundir feromonas en el Grid (double-buffer swap)
         self.diffusion.step(&mut self.grid);
 
         // 4. Regenerar recursos en fuentes de alimento (M7)
-        run_resource_regeneration(&mut self.grid, &self.food_sources, 1.0);
+        run_resource_regeneration(&mut self.grid, &self.food_sources, self.system_dynamics.season_factor());
 
         // 5. Ejecutar sistemas ECS en orden canónico
         //    Orden: Movement → Age → Energy → Foraging → Trophallaxis → Disease → Mortality → Role → Brood → Predator
         {
             run_movement_system(&mut self.world, &mut self.grid, &self.rng, self.tick);
             run_age_system(&mut self.world);
-            run_energy_system(&mut self.world, self.global_temp);   // M4
+            run_energy_system(&mut self.world, self.system_dynamics.global_temp, self.system_dynamics.pesticide_pressure); // M4/M10
             run_foraging_system(                                      // M7
                 &mut self.world,
                 &mut self.grid,
@@ -208,6 +208,9 @@ impl Orchestrator {
                 by_energy: self.deaths_by_energy,
                 ..Default::default()
             },
+            season_phase: self.system_dynamics.season_phase,
+            global_temp: self.system_dynamics.global_temp,
+            brood_production_rate: self.system_dynamics.brood_production_rate,
             ..Default::default()
         }
     }
@@ -486,6 +489,40 @@ mod tests {
             let a = std::fs::read(dir_a.path().join(filename)).unwrap();
             let b = std::fs::read(dir_b.path().join(filename)).unwrap();
             assert_eq!(a, b, "M7: archivo {filename} difiere entre runs con misma semilla");
+        }
+    }
+
+    // --- M10: SystemDynamics / Estacionalidad -----------------------------------
+
+    #[test]
+    fn season_phase_in_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            max_ticks: Some(61),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        orch.run();
+
+        let content = std::fs::read_to_string(dir.path().join("metrics_00000060.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let phase = parsed["season_phase"].as_f64().unwrap_or(0.0);
+        assert!(phase > 0.0, "season_phase debe ser > 0 tras 60 ticks, obtenido {phase}");
+    }
+
+    #[test]
+    fn determinism_preserved_with_m10() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        make_orchestrator(11, 121, &dir_a).run();
+        make_orchestrator(11, 121, &dir_b).run();
+
+        for filename in &["metrics_00000000.json", "metrics_00000060.json", "metrics_00000120.json"] {
+            let a = std::fs::read(dir_a.path().join(filename)).unwrap();
+            let b = std::fs::read(dir_b.path().join(filename)).unwrap();
+            assert_eq!(a, b, "M10: archivo {filename} difiere entre runs con misma semilla");
         }
     }
 

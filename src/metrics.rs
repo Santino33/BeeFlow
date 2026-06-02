@@ -49,6 +49,9 @@ pub struct MetricsSnapshot {
     pub brood_adult_ratio: f32,
     pub sir_prevalence: SirPrevalence,
     pub time_to_collapse: Option<u64>,
+    pub season_phase: f32,
+    pub global_temp: f32,
+    pub brood_production_rate: f32,
 }
 
 /// Exporta métricas a disco en formato JSON cada `export_every` ticks.

@@ -5,4 +5,5 @@ pub mod grid;
 pub mod metrics;
 pub mod orchestrator;
 pub mod rng;
+pub mod system_dynamics;
 pub mod systems;

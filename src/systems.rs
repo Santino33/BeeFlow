@@ -138,15 +138,21 @@ pub fn run_age_system(world: &mut hecs::World) {
 
 /// Aplica el costo metabólico a todas las abejas, modulado por temperatura y rol.
 /// Drone: 0.025/tick (simulation_spec.md §Roles). Resto: METABOLIC_COST_BASAL.
+/// Foragers reciben drain adicional de `0.001 × pesticide_pressure` por pesticidas (M10).
 /// La energía se clampea a 0.0; la muerte la gestiona MortalitySystem (M5).
-pub fn run_energy_system(world: &mut hecs::World, global_temp: f32) {
+pub fn run_energy_system(world: &mut hecs::World, global_temp: f32, pesticide_pressure: f32) {
     let temp_factor = 1.0 + 0.01 * (global_temp - 20.0);
     for (_, (energy, role)) in world.query_mut::<(&mut EnergyComponent, Option<&RoleComponent>)>() {
         let base_cost = match role.map(|r| r.0) {
             Some(Role::Drone) => 0.025,
             _                 => METABOLIC_COST_BASAL,
         };
-        energy.0 = (energy.0 - base_cost * temp_factor).max(0.0);
+        let extra_cost = if role.map(|r| r.0) == Some(Role::Forager) {
+            0.001 * pesticide_pressure
+        } else {
+            0.0
+        };
+        energy.0 = (energy.0 - (base_cost + extra_cost) * temp_factor).max(0.0);
     }
 }
 
@@ -562,7 +568,7 @@ mod tests {
         }
 
         for _ in 0..51 {
-            run_energy_system(&mut world, 20.0);
+            run_energy_system(&mut world, 20.0, 0.0);
             run_mortality_system(&mut world, &mut grid);
         }
 
@@ -580,7 +586,7 @@ mod tests {
         let mut world = hecs::World::new();
         world.spawn(make_bee(50, 50)); // energy = 0.8
 
-        run_energy_system(&mut world, 20.0);
+        run_energy_system(&mut world, 20.0, 0.0);
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
             assert!(
@@ -596,7 +602,7 @@ mod tests {
         let mut world = hecs::World::new();
         world.spawn((EnergyComponent(0.01), AgeComponent(0)));
 
-        run_energy_system(&mut world, 20.0);
+        run_energy_system(&mut world, 20.0, 0.0);
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
             assert!(energy.0 >= 0.0, "energy no debe ser negativa");
@@ -609,7 +615,7 @@ mod tests {
         world.spawn((EnergyComponent(1.0), AgeComponent(0)));
 
         for _ in 0..50 {
-            run_energy_system(&mut world, 20.0);
+            run_energy_system(&mut world, 20.0, 0.0);
         }
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
@@ -626,7 +632,7 @@ mod tests {
         let mut world = hecs::World::new();
         world.spawn((EnergyComponent(1.0), AgeComponent(0)));
 
-        run_energy_system(&mut world, 30.0); // factor = 1 + 0.01*10 = 1.1 → cost = 0.022
+        run_energy_system(&mut world, 30.0, 0.0); // factor = 1 + 0.01*10 = 1.1 → cost = 0.022
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
             let expected = 1.0 - 0.022_f32;
@@ -690,7 +696,7 @@ mod tests {
         let mut world = hecs::World::new();
         world.spawn((EnergyComponent(1.0), RoleComponent(Role::Drone), AgeComponent(0)));
 
-        run_energy_system(&mut world, 20.0);
+        run_energy_system(&mut world, 20.0, 0.0);
 
         for (_, energy) in world.query::<&EnergyComponent>().iter() {
             let expected = 1.0_f32 - 0.025;
@@ -959,6 +965,43 @@ mod tests {
 
         let res = grid.resource_amount[SpatialGrid::idx(20, 50)];
         assert!((res - 1.0).abs() < 1e-5, "recurso no debe superar 1.0");
+    }
+
+    // --- M10: EnergySystem con pesticidas ---------------------------------------
+
+    #[test]
+    fn pesticide_drains_forager_extra() {
+        let mut world = hecs::World::new();
+        let forager = world.spawn((
+            EnergyComponent(1.0),
+            RoleComponent(Role::Forager),
+            AgeComponent(0),
+        ));
+        let nurse = world.spawn((
+            EnergyComponent(1.0),
+            RoleComponent(Role::Nurse),
+            AgeComponent(0),
+        ));
+
+        run_energy_system(&mut world, 20.0, 1.0); // pesticide_pressure = 1.0
+
+        let mut qf = world.query_one::<&EnergyComponent>(forager).unwrap();
+        let mut qn = world.query_one::<&EnergyComponent>(nurse).unwrap();
+        let forager_energy = qf.get().unwrap().0;
+        let nurse_energy   = qn.get().unwrap().0;
+
+        // Forager pierde METABOLIC_COST_BASAL + 0.001 * 1.0 = 0.021
+        assert!(
+            (forager_energy - (1.0 - 0.021)).abs() < 1e-5,
+            "Forager debe perder 0.021/tick con pesticida=1.0, obtenido {}",
+            forager_energy
+        );
+        // Nurse no tiene extra drain
+        assert!(
+            (nurse_energy - (1.0 - 0.020)).abs() < 1e-5,
+            "Nurse debe perder solo 0.020/tick, obtenido {}",
+            nurse_energy
+        );
     }
 
     // --- M9: TrophallaxisSystem -------------------------------------------------
