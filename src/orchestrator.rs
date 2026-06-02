@@ -11,7 +11,7 @@ use crate::components::{
 use crate::config::RunConfig;
 use crate::diffusion::DiffusionSystem;
 use crate::system_dynamics::SystemDynamicsState;
-use crate::grid::{SpatialGrid, BORDER, FOOD_SOURCE_POSITIONS, GRID_W, HIVE_X, HIVE_Y};
+use crate::grid::{PheromoneKind, SpatialGrid, BORDER, FOOD_SOURCE_POSITIONS, GRID_W, HIVE_X, HIVE_Y};
 use crate::metrics::{MetricsExporter, MetricsSnapshot, MortalityBreakdown, RoleDistribution};
 use crate::rng::RngSystem;
 use crate::systems::{
@@ -397,10 +397,10 @@ fn spawn_initial_population(
     }
     let n_rest = (count - 1) as usize;
 
-    // Distribución: 20% Forager, 10% Guard, 9% Builder, ~61% Nurse (absorbe residuo)
-    let n_foragers = n_rest * 20 / 100;
-    let n_guards   = n_rest * 10 / 100;
-    let n_builders = n_rest *  9 / 100;
+    // Distribución: 30% Forager, 8% Guard, 7% Builder, ~55% Nurse (absorbe residuo)
+    let n_foragers = n_rest * 30 / 100;
+    let n_guards   = n_rest *  8 / 100;
+    let n_builders = n_rest *  7 / 100;
     let n_nurses   = n_rest - n_foragers - n_guards - n_builders;
 
     // Nodrizas, Guardianas, Constructoras — con RoleTransitionState (M8)
@@ -490,6 +490,8 @@ fn init_food_sources(grid: &mut SpatialGrid) -> Vec<(usize, usize)> {
                 let y = (cy as i32 + dy) as usize;
                 if SpatialGrid::in_bounds(x, y) && !grid.is_obstacle[SpatialGrid::idx(x, y)] {
                     grid.set_resource(x, y, 1.0);
+                    // Pre-sembrar feromona de atracción para bootstrap de forrajeadores
+                    grid.add_pheromone(x, y, PheromoneKind::Attraction, 1.0);
                     sources.push((x, y));
                 }
             }

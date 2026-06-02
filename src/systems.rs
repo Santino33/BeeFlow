@@ -12,7 +12,7 @@ use crate::rng::RngSystem;
 pub const METABOLIC_COST_BASAL: f32 = 0.001;
 
 /// Máxima carga de néctar que puede llevar un Forager (simulation_spec.md §Forrajeo).
-pub const FORAGER_CARRY_MAX: f32 = 0.5;
+pub const FORAGER_CARRY_MAX: f32 = 1.0;
 
 /// Radio Manhattan al que un Forager deposita su carga en la colmena.
 pub const HIVE_DEPOSIT_RADIUS: u32 = 8;
@@ -257,7 +257,10 @@ pub fn run_foraging_system(
     }
 }
 
-/// Regenera recursos en las fuentes de alimento a 0.001/tick × season_factor.
+/// Tasa de regeneración de recursos por celda por tick (simulation_spec.md §Recursos).
+pub const RESOURCE_REGEN_RATE: f32 = 0.005;
+
+/// Regenera recursos en las fuentes de alimento a RESOURCE_REGEN_RATE/tick × season_factor.
 /// simulation_spec.md §Recursos.
 pub fn run_resource_regeneration(
     grid: &mut SpatialGrid,
@@ -266,7 +269,7 @@ pub fn run_resource_regeneration(
 ) {
     for &(x, y) in food_sources {
         let idx = SpatialGrid::idx(x, y);
-        grid.resource_amount[idx] = (grid.resource_amount[idx] + 0.001 * season_factor).min(1.0);
+        grid.resource_amount[idx] = (grid.resource_amount[idx] + RESOURCE_REGEN_RATE * season_factor).min(1.0);
     }
 }
 
