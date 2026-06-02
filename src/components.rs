@@ -29,9 +29,12 @@ pub struct RoleComponent(pub Role);
 #[derive(Clone, Copy, Debug)]
 pub struct EnergyComponent(pub f32);
 
-/// Estado epidemiológico de la abeja.
+/// Estado epidemiológico de la abeja con timer de duración. simulation_spec.md §Disease.
 #[derive(Clone, Copy, Debug)]
-pub struct HealthComponent(pub SirState);
+pub struct HealthComponent {
+    pub state: SirState,
+    pub ticks_in_state: u32, // ticks desde el último cambio de estado
+}
 
 /// Edad en ticks desde la eclosión.
 #[derive(Clone, Copy, Debug)]
@@ -57,4 +60,27 @@ pub struct ForagerStateComponent(pub ForagerPhase);
 pub struct RoleTransitionState {
     pub cooldown: u32,        // ticks restantes hasta próxima transición
     pub threshold_bias: f32,  // factor ±10% del umbral base, fijo por agente desde seed
+}
+
+/// Etapa de desarrollo de la cría. simulation_spec.md §Ciclo de Cría.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BroodStage {
+    Egg,
+    Larva { health_virtual: f32 }, // 1.0 inicial; muere al llegar a 0
+    Pupa,
+}
+
+pub struct BroodStageComponent(pub BroodStage);
+
+// ---------------------------------------------------------------------------
+// M13: Predators
+// ---------------------------------------------------------------------------
+
+/// Depredador externo. No tiene RoleComponent ni HealthComponent.
+/// simulation_spec.md §Predator.
+#[derive(Clone, Copy, Debug)]
+pub struct PredatorComponent {
+    pub attack_rate: f32,         // P(ataque exitoso) por tick (0.3)
+    pub detection_radius: u32,    // Chebyshev: celdas de detección (2)
+    pub energy_drain_on_hit: f32, // energía drenada a la abeja atacada (0.4)
 }

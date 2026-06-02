@@ -1,6 +1,6 @@
 use rayon::prelude::*;
 
-use crate::grid::{PheromoneKind, SpatialGrid, GRID_H, GRID_W, TOTAL_CELLS};
+use crate::grid::{SpatialGrid, GRID_H, GRID_W, PHEROMONE_CHANNELS, TOTAL_CELLS};
 
 /// Tasa de decaimiento por tick: concentration *= (1 - DECAY_RATE).
 /// Fuente: simulation_spec.md §Feromonas diffusion.decay_rate
@@ -14,23 +14,36 @@ const KERNEL: [f32; 3] = [0.25, 0.5, 0.25];
 /// Implementa un kernel Gaussiano 3×3 separable (paso H + paso V) con:
 /// - Absorción en bordes (sin rebote ni toroide)
 /// - Decaimiento exponencial 5 %/tick
-/// - Paralelización por filas con rayon
+/// - Paralelización por filas (rayon) dentro de cada canal
+/// - Paralelización entre los 3 canales independientes (rayon, H6)
 pub struct DiffusionSystem {
-    temp: Vec<f32>, // buffer intermedio entre el paso H y el paso V
+    temps: [Vec<f32>; PHEROMONE_CHANNELS], // un buffer intermedio H→V por canal
 }
 
 impl DiffusionSystem {
     pub fn new() -> Self {
-        Self { temp: vec![0.0; TOTAL_CELLS] }
+        Self {
+            temps: [
+                vec![0.0; TOTAL_CELLS],
+                vec![0.0; TOTAL_CELLS],
+                vec![0.0; TOTAL_CELLS],
+            ],
+        }
     }
 
-    /// Difunde y decae los 3 canales de feromonas, luego hace swap del double-buffer.
+    /// Difunde y decae los 3 canales de feromonas en paralelo, luego hace swap del double-buffer.
+    /// Los 3 canales son independientes entre sí y se procesan con rayon::zip.
     pub fn step(&mut self, grid: &mut SpatialGrid) {
-        for kind in [PheromoneKind::Alarm, PheromoneKind::Task, PheromoneKind::Attraction] {
-            let (read, write, obstacles) = grid.channel_bufs_mut(kind);
-            h_pass(read, &mut self.temp, obstacles);
-            v_pass(&self.temp, write, obstacles);
-        }
+        let (channel_bufs, obs) = grid.all_channel_bufs_for_diffusion();
+
+        self.temps
+            .par_iter_mut()
+            .zip(channel_bufs.into_par_iter())
+            .for_each(|(temp, (read, write))| {
+                h_pass(read, temp, obs);
+                v_pass(temp, write, obs);
+            });
+
         grid.swap_pheromone_buffers();
     }
 }
@@ -107,7 +120,7 @@ fn v_pass(src: &[f32], dst: &mut [f32], obstacles: &[bool]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::{SpatialGrid, GRID_H, GRID_W};
+    use crate::grid::{PheromoneKind, SpatialGrid, GRID_H, GRID_W};
 
     fn spatial_entropy(grid: &SpatialGrid, kind: PheromoneKind) -> f32 {
         let slice = grid.pheromone_read_slice(kind);
@@ -175,6 +188,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Verifica que la difusión paralela (3 canales simultáneos) produce el mismo
+    /// resultado numérico que el comportamiento esperado: los tests existentes
+    /// (spread, decay, border) ya cubren correctitud; este test asegura que el
+    /// refactor H6 no introduce divergencia entre canales.
+    #[test]
+    fn parallel_channels_are_independent() {
+        // Alimentar 3 canales con fuentes distintas y verificar que no se mezclan.
+        let mut grid = SpatialGrid::new();
+        let mut sys = DiffusionSystem::new();
+
+        grid.add_pheromone(30, 30, PheromoneKind::Alarm, 1.0);
+        grid.add_pheromone(50, 50, PheromoneKind::Task, 1.0);
+        grid.add_pheromone(70, 70, PheromoneKind::Attraction, 1.0);
+        grid.swap_pheromone_buffers();
+
+        for _ in 0..10 {
+            sys.step(&mut grid);
+        }
+
+        // Alarm solo debe haber difundido desde (30,30): el centro de Task (50,50)
+        // debe tener concentración Alarm ≈ 0 (muy lejos de la fuente tras 10 steps).
+        let alarm_at_task_center = grid.pheromone(50, 50, PheromoneKind::Alarm);
+        assert!(
+            alarm_at_task_center < 1e-3,
+            "Alarm no debe contaminar el centro de Task: {alarm_at_task_center}"
+        );
+
+        // Task debe seguir presente cerca de (50,50)
+        let task_at_center = grid.pheromone(50, 50, PheromoneKind::Task);
+        assert!(task_at_center > 0.0, "Task debe seguir presente en (50,50): {task_at_center}");
+
+        // Attraction solo difundida desde (70,70): no debe aparecer en (30,30)
+        let attraction_at_alarm = grid.pheromone(30, 30, PheromoneKind::Attraction);
+        assert!(
+            attraction_at_alarm < 1e-3,
+            "Attraction no debe contaminar el centro de Alarm: {attraction_at_alarm}"
+        );
     }
 
     #[test]

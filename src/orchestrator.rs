@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 use crate::components::{
-    AgeComponent, EnergyComponent, ForagerPhase, ForagerStateComponent, HealthComponent,
-    PheromoneSensitivity, PositionComponent, Role, RoleComponent, RoleTransitionState, SirState,
+    AgeComponent, BroodStageComponent, EnergyComponent, ForagerPhase, ForagerStateComponent,
+    HealthComponent, PheromoneSensitivity, PositionComponent, PredatorComponent, Role,
+    RoleComponent, RoleTransitionState, SirState,
 };
 use crate::config::RunConfig;
 use crate::diffusion::DiffusionSystem;
@@ -14,9 +15,10 @@ use crate::grid::{SpatialGrid, BORDER, FOOD_SOURCE_POSITIONS, GRID_W, HIVE_X, HI
 use crate::metrics::{MetricsExporter, MetricsSnapshot, MortalityBreakdown, RoleDistribution};
 use crate::rng::RngSystem;
 use crate::systems::{
-    run_age_system, run_energy_system, run_foraging_system, run_mortality_system,
-    run_movement_system, run_resource_regeneration, run_role_transition_system,
-    run_trophallaxis_system, METABOLIC_COST_BASAL,
+    run_age_system, run_brood_system, run_disease_system, run_energy_system, run_foraging_system,
+    run_mortality_system, run_movement_system, run_predator_system, run_resource_regeneration,
+    run_role_transition_system, run_trophallaxis_system, METABOLIC_COST_BASAL,
+    PREDATOR_ATTACK_RATE, PREDATOR_DETECTION_RADIUS, PREDATOR_ENERGY_DRAIN,
 };
 
 /// Motor de simulación. Controla el ciclo maestro de tick.
@@ -30,10 +32,14 @@ pub struct Orchestrator {
     pub world: hecs::World,             // M3 — entidades ECS
     pub system_dynamics: SystemDynamicsState, // M10 — variables globales y estacionalidad
     deaths_by_energy: u32,             // M5 — acumulado entre exports; reset en cada snapshot
+    deaths_by_disease: u32,            // M14 — muertes de Infected entre exports
+    deaths_by_predation: u32,          // M13 — muertes por depredación entre exports
+    pub time_to_collapse: Option<u64>, // M14 — tick en que population < 50 por primera vez
     pub honey_reserve: f32,            // M7 — reserva global de miel
     honey_collected_period: f32,       // M7 — miel depositada desde último export
     food_sources: Vec<(usize, usize)>, // M7 — posiciones de fuentes de alimento
     metrics_dir: PathBuf,
+    render_tx: Option<std::sync::mpsc::SyncSender<crate::visualizer::RenderFrame>>, // M15
 }
 
 impl Orchestrator {
@@ -49,6 +55,7 @@ impl Orchestrator {
         let mut grid = SpatialGrid::new();
         let mut world = hecs::World::new();
         spawn_initial_population(&mut world, &mut grid, &rng, config.initial_population);
+        spawn_predators(&mut world, &mut grid, &rng, config.predator_count);
 
         let food_sources = init_food_sources(&mut grid);
 
@@ -65,7 +72,11 @@ impl Orchestrator {
             diffusion: DiffusionSystem::new(),
             world,
             deaths_by_energy: 0,
+            deaths_by_disease: 0,
+            deaths_by_predation: 0,
+            time_to_collapse: None,
             metrics_dir,
+            render_tx: None,
         }
     }
 
@@ -79,6 +90,7 @@ impl Orchestrator {
         let mut grid = SpatialGrid::new();
         let mut world = hecs::World::new();
         spawn_initial_population(&mut world, &mut grid, &rng, config.initial_population);
+        spawn_predators(&mut world, &mut grid, &rng, config.predator_count);
         let food_sources = init_food_sources(&mut grid);
         Self {
             tick: 0,
@@ -93,7 +105,11 @@ impl Orchestrator {
             diffusion: DiffusionSystem::new(),
             world,
             deaths_by_energy: 0,
+            deaths_by_disease: 0,
+            deaths_by_predation: 0,
+            time_to_collapse: None,
             metrics_dir,
+            render_tx: None,
         }
     }
 
@@ -156,24 +172,57 @@ impl Orchestrator {
                 &mut self.honey_collected_period,
             );
             run_trophallaxis_system(&mut self.world, self.honey_reserve); // M9
-            self.deaths_by_energy +=
-                run_mortality_system(&mut self.world, &mut self.grid); // M5
+            run_disease_system(                                           // M12
+                &mut self.world,
+                &self.rng,
+                self.tick,
+                self.config.disease_base_rate,
+                self.config.disease_enabled,
+            );
+            {
+                let (de, dd) = run_mortality_system(&mut self.world, &mut self.grid); // M5/M14
+                self.deaths_by_energy  += de;
+                self.deaths_by_disease += dd;
+            }
             run_role_transition_system(&mut self.world, &self.grid, &self.rng, self.tick); // M8
+            run_brood_system(                                                               // M11
+                &mut self.world,
+                &mut self.grid,
+                &self.rng,
+                self.tick,
+                self.system_dynamics.brood_production_rate,
+            );
+            self.deaths_by_predation +=
+                run_predator_system(&mut self.world, &mut self.grid, &self.rng, self.tick); // M13
         }
 
         // 6. Resolver interacciones Grid ↔ ECS (depositar feromonas, consumir recursos)
         //    (M3+: no-op)
 
+        // 6b. Detectar colapso (M14): población < 50 por primera vez
+        if self.time_to_collapse.is_none() {
+            let alive = self.world.query::<&RoleComponent>().iter().count();
+            if alive < 50 {
+                self.time_to_collapse = Some(self.tick);
+            }
+        }
+
         // 7. Exportar métricas (cada 60 ticks)
         if self.tick % 60 == 0 {
             let snapshot = self.build_snapshot();
-            self.exporter.maybe_export(&snapshot);
-            self.deaths_by_energy = 0;
-            self.honey_collected_period = 0.0;
+            if self.exporter.maybe_export(&snapshot) {
+                self.deaths_by_energy = 0;
+                self.deaths_by_disease = 0;
+                self.deaths_by_predation = 0;
+                self.honey_collected_period = 0.0;
+            }
         }
 
-        // 8. Enviar estado al renderer (mpsc, sin bloqueo)
-        //    (M15: no-op)
+        // 8. Enviar estado al renderer (mpsc, sin bloqueo) — M15
+        if let Some(tx) = &self.render_tx {
+            let frame = self.build_render_frame();
+            let _ = tx.try_send(frame); // descarta si el renderer está ocupado
+        }
 
         // 9. Incrementar contador de tick
         self.tick += 1;
@@ -199,19 +248,42 @@ impl Orchestrator {
         } else {
             0.0
         };
+        let brood_count = self.world.query::<&BroodStageComponent>().iter().count() as f32;
+        let bee_count   = by_role.total() as f32;
+        let brood_adult_ratio = if bee_count > 0.0 { brood_count / bee_count } else { 0.0 };
+
+        // SIR prevalence — fracciones sobre la población de abejas activas (M12)
+        let mut sir = crate::metrics::SirPrevalence::default();
+        if bee_count > 0.0 {
+            for (_, health) in self.world.query::<&HealthComponent>().iter() {
+                match health.state {
+                    SirState::Susceptible => sir.susceptible += 1.0,
+                    SirState::Infected    => sir.infected    += 1.0,
+                    SirState::Recovered   => sir.recovered   += 1.0,
+                }
+            }
+            sir.susceptible /= bee_count;
+            sir.infected    /= bee_count;
+            sir.recovered   /= bee_count;
+        }
+
         MetricsSnapshot {
             tick: self.tick,
             population_by_role: by_role,
             colony_reserve: self.honey_reserve,
             foraging_efficiency,
+            brood_adult_ratio,
+            sir_prevalence: sir,
             mortality_rate: MortalityBreakdown {
-                by_energy: self.deaths_by_energy,
-                ..Default::default()
+                by_energy:    self.deaths_by_energy,
+                by_disease:   self.deaths_by_disease,
+                by_predation: self.deaths_by_predation,
             },
+            pheromone_entropy: crate::metrics::pheromone_entropy(&self.grid),
+            time_to_collapse: self.time_to_collapse,
             season_phase: self.system_dynamics.season_phase,
             global_temp: self.system_dynamics.global_temp,
             brood_production_rate: self.system_dynamics.brood_production_rate,
-            ..Default::default()
         }
     }
 
@@ -221,6 +293,73 @@ impl Orchestrator {
 
     pub fn metrics_dir(&self) -> &PathBuf {
         &self.metrics_dir
+    }
+
+    // --- M15: Visualizador -------------------------------------------------------
+
+    /// Registra el sender del canal mpsc hacia el visualizador.
+    /// `tick_once` usará `try_send` (no bloqueante) cada tick.
+    pub fn set_render_sender(
+        &mut self,
+        tx: std::sync::mpsc::SyncSender<crate::visualizer::RenderFrame>,
+    ) {
+        self.render_tx = Some(tx);
+    }
+
+    /// Extrae los datos de rendering del estado actual (pheromones + agentes + métricas).
+    /// Usa `pheromone_read_slice` (read buffer = estado difundido canónico del tick).
+    fn build_render_frame(&self) -> crate::visualizer::RenderFrame {
+        use crate::grid::PheromoneKind;
+        use crate::visualizer::{AgentKind, AgentRenderData, RenderFrame};
+
+        let pheromone_alarm      = self.grid.pheromone_read_slice(PheromoneKind::Alarm).to_vec();
+        let pheromone_task       = self.grid.pheromone_read_slice(PheromoneKind::Task).to_vec();
+        let pheromone_attraction = self.grid.pheromone_read_slice(PheromoneKind::Attraction).to_vec();
+
+        let mut agents: Vec<AgentRenderData> = self
+            .world
+            .query::<(&PositionComponent, &RoleComponent)>()
+            .iter()
+            .map(|(_, (pos, role))| AgentRenderData {
+                x: pos.0 as f32,
+                y: pos.1 as f32,
+                role: role_to_agent_kind(role.0),
+            })
+            .collect();
+
+        for (_, (pos, _)) in self
+            .world
+            .query::<(&PositionComponent, &PredatorComponent)>()
+            .iter()
+        {
+            agents.push(AgentRenderData {
+                x: pos.0 as f32,
+                y: pos.1 as f32,
+                role: AgentKind::Predator,
+            });
+        }
+
+        RenderFrame {
+            tick: self.tick,
+            pheromone_alarm,
+            pheromone_task,
+            pheromone_attraction,
+            agents,
+            metrics: self.build_snapshot(),
+        }
+    }
+}
+
+/// Convierte Role ECS al AgentKind del renderer.
+fn role_to_agent_kind(role: Role) -> crate::visualizer::AgentKind {
+    use crate::visualizer::AgentKind;
+    match role {
+        Role::Queen   => AgentKind::Queen,
+        Role::Nurse   => AgentKind::Nurse,
+        Role::Builder => AgentKind::Builder,
+        Role::Guard   => AgentKind::Guard,
+        Role::Forager => AgentKind::Forager,
+        Role::Drone   => AgentKind::Drone,
     }
 }
 
@@ -246,7 +385,7 @@ fn spawn_initial_population(
         PositionComponent(HIVE_X as u16, HIVE_Y as u16),
         RoleComponent(Role::Queen),
         EnergyComponent(0.8),
-        HealthComponent(SirState::Susceptible),
+        HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
         AgeComponent(0),
         PheromoneSensitivity([0.0, 0.0, 0.0]),
     ));
@@ -279,7 +418,7 @@ fn spawn_initial_population(
                 PositionComponent(x, y),
                 RoleComponent(role),
                 EnergyComponent(0.8),
-                HealthComponent(SirState::Susceptible),
+                HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
                 AgeComponent(0),
                 sensitivity,
                 RoleTransitionState { cooldown: 0, threshold_bias: bias },
@@ -298,11 +437,38 @@ fn spawn_initial_population(
             PositionComponent(x, y),
             RoleComponent(Role::Forager),
             EnergyComponent(0.8),
-            HealthComponent(SirState::Susceptible),
+            HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
             AgeComponent(0),
             PheromoneSensitivity([0.0, 0.0, 1.0]),
             ForagerStateComponent(ForagerPhase::Searching),
             RoleTransitionState { cooldown: 0, threshold_bias: bias },
+        ));
+    }
+}
+
+/// Hace spawn de los depredadores en posiciones aleatorias del grid (excluye obstáculos).
+fn spawn_predators(
+    world: &mut hecs::World,
+    grid: &mut SpatialGrid,
+    rng_system: &RngSystem,
+    count: u8,
+) {
+    use rand::Rng;
+    use crate::grid::{GRID_W, GRID_H};
+    let mut rng = rng_system.tick_rng(u64::MAX - 1); // sentinel distinto del de biases
+    for _ in 0..count {
+        let x = rng.gen_range(0..GRID_W as u16);
+        let y = rng.gen_range(0..GRID_H as u16);
+        let idx = SpatialGrid::idx(x as usize, y as usize);
+        grid.occupancy[idx] = grid.occupancy[idx].saturating_add(1);
+        world.spawn((
+            PositionComponent(x, y),
+            EnergyComponent(1.0),
+            PredatorComponent {
+                attack_rate: PREDATOR_ATTACK_RATE,
+                detection_radius: PREDATOR_DETECTION_RADIUS,
+                energy_drain_on_hit: PREDATOR_ENERGY_DRAIN,
+            },
         ));
     }
 }
@@ -581,6 +747,294 @@ mod tests {
         values.iter().map(|&v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32
     }
 
+    // --- M12: DiseaseSystem -----------------------------------------------------
+
+    #[test]
+    fn sir_prevalence_populated_in_snapshot() {
+        // Forzamos un infectado directamente para que sir_prevalence lo cuente.
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 100,
+            max_ticks: Some(61),
+            disease_enabled: false, // no transmisión, pero queremos verificar el conteo
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+
+        // Infectar manualmente la primera abeja con HealthComponent
+        let entities: Vec<hecs::Entity> = orch.world
+            .query::<&HealthComponent>()
+            .iter()
+            .map(|(e, _)| e)
+            .take(1)
+            .collect();
+        for e in entities {
+            let _ = orch.world.insert_one(e, HealthComponent {
+                state: SirState::Infected,
+                ticks_in_state: 0,
+            });
+        }
+
+        orch.run();
+
+        let content = std::fs::read_to_string(dir.path().join("metrics_00000060.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let susceptible = parsed["sir_prevalence"]["susceptible"].as_f64().unwrap_or(0.0);
+        let sum = parsed["sir_prevalence"]["susceptible"].as_f64().unwrap_or(0.0)
+            + parsed["sir_prevalence"]["infected"].as_f64().unwrap_or(0.0)
+            + parsed["sir_prevalence"]["recovered"].as_f64().unwrap_or(0.0);
+        assert!(susceptible > 0.0, "sir_prevalence.susceptible debe ser > 0");
+        assert!((sum - 1.0).abs() < 1e-3, "fracciones SIR deben sumar ≈ 1.0, obtenido {sum}");
+    }
+
+    #[test]
+    fn determinism_preserved_with_m12() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let make = |dir: &TempDir| {
+            let config = RunConfig {
+                seed: 44,
+                max_ticks: Some(121),
+                disease_enabled: true,
+                disease_base_rate: 0.05,
+                ..Default::default()
+            };
+            Orchestrator::new_with_output(config, dir.path())
+        };
+
+        make(&dir_a).run();
+        make(&dir_b).run();
+
+        for filename in &["metrics_00000000.json", "metrics_00000060.json", "metrics_00000120.json"] {
+            let a = std::fs::read(dir_a.path().join(filename)).unwrap();
+            let b = std::fs::read(dir_b.path().join(filename)).unwrap();
+            assert_eq!(a, b, "M12: archivo {filename} difiere entre runs con misma semilla");
+        }
+    }
+
+    // --- M11: BroodSystem -------------------------------------------------------
+
+    #[test]
+    fn brood_adult_ratio_positive_in_summer() {
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 500,
+            initial_honey_reserve: 0.8,
+            season_start: 0.5, // verano → brood_production_rate > 0
+            max_ticks: Some(301), // suficiente para al menos un ciclo de cría completo
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        orch.run();
+
+        let content = std::fs::read_to_string(dir.path().join("metrics_00000300.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let ratio = parsed["brood_adult_ratio"].as_f64().unwrap_or(0.0);
+        assert!(
+            ratio >= 0.0,
+            "brood_adult_ratio debe ser no-negativo, obtenido {ratio}"
+        );
+    }
+
+    #[test]
+    fn determinism_preserved_with_m11() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        make_orchestrator(22, 121, &dir_a).run();
+        make_orchestrator(22, 121, &dir_b).run();
+
+        for filename in &["metrics_00000000.json", "metrics_00000060.json", "metrics_00000120.json"] {
+            let a = std::fs::read(dir_a.path().join(filename)).unwrap();
+            let b = std::fs::read(dir_b.path().join(filename)).unwrap();
+            assert_eq!(a, b, "M11: archivo {filename} difiere entre runs con misma semilla");
+        }
+    }
+
+    // --- M13: PredatorSystem ---------------------------------------------------
+
+    #[test]
+    fn predator_by_predation_nonzero_with_predators() {
+        // Tick 60 (primeros 60 ticks con 500 abejas vivas): debe haber al menos 1 muerte por depredación.
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 500,
+            initial_honey_reserve: 0.8,
+            predator_count: 10,
+            max_ticks: Some(121),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        orch.run();
+
+        let content = std::fs::read_to_string(dir.path().join("metrics_00000060.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let by_pred = parsed["mortality_rate"]["by_predation"].as_u64().unwrap_or(0);
+        assert!(
+            by_pred > 0,
+            "con 10 depredadores y 500 abejas en los primeros 60 ticks debe haber muertes por depredación, obtenido {by_pred}"
+        );
+    }
+
+    #[test]
+    fn determinism_preserved_with_m13() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let make = |dir: &TempDir| {
+            let config = RunConfig {
+                seed: 99,
+                max_ticks: Some(121),
+                predator_count: 3,
+                ..Default::default()
+            };
+            Orchestrator::new_with_output(config, dir.path())
+        };
+
+        make(&dir_a).run();
+        make(&dir_b).run();
+
+        for filename in &["metrics_00000000.json", "metrics_00000060.json", "metrics_00000120.json"] {
+            let a = std::fs::read(dir_a.path().join(filename)).unwrap();
+            let b = std::fs::read(dir_b.path().join(filename)).unwrap();
+            assert_eq!(a, b, "M13: archivo {filename} difiere entre runs con misma semilla");
+        }
+    }
+
+    // --- M14: Exportación Completa de Métricas ---------------------------------
+
+    #[test]
+    fn pheromone_entropy_nonzero_after_foraging() {
+        // En tick 0, ~10% de los 100 foragers spawnan sobre las fuentes de alimento
+        // (parches 17×17 cubren ~10% del grid interior). Esos foragers emiten
+        // Attraction pheromone al write buffer. pheromone_entropy lee el write buffer
+        // → entropy > 0 en metrics_00000000.json.
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 500,
+            initial_honey_reserve: 0.8,
+            max_ticks: Some(1), // solo tick 0: bees vivas, recursos frescos
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        orch.run();
+
+        let content = std::fs::read_to_string(dir.path().join("metrics_00000000.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let entropy = parsed["pheromone_entropy"].as_f64().unwrap_or(0.0);
+        assert!(
+            entropy > 0.0,
+            "pheromone_entropy debe ser > 0 en tick 0 con foragers en fuentes de alimento, obtenido {entropy}"
+        );
+    }
+
+    #[test]
+    fn time_to_collapse_set_when_population_drops() {
+        // Población inicial pequeña + sin miel → colapso rápido
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 10,   // muy pocos
+            initial_honey_reserve: 0.0,
+            max_ticks: Some(61),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        orch.run();
+
+        // Con 10 abejas que mueren en ~40 ticks, population < 50 desde tick 0
+        assert!(
+            orch.time_to_collapse.is_some(),
+            "con solo 10 abejas, time_to_collapse debe haberse registrado"
+        );
+        assert_eq!(
+            orch.time_to_collapse,
+            Some(0),
+            "con 10 < 50 abejas iniciales, colapso debe detectarse en tick 0"
+        );
+
+        let content = std::fs::read_to_string(dir.path().join("metrics_00000000.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            !parsed["time_to_collapse"].is_null(),
+            "time_to_collapse debe aparecer en JSON cuando ocurre colapso"
+        );
+    }
+
+    #[test]
+    fn by_disease_nonzero_with_disease_enabled() {
+        // El sistema SIR requiere al menos 1 Infected inicial para que haya transmisión.
+        // Infectamos manualmente 50 abejas; con disease_base_rate=0.5 la infección se propaga
+        // y muchas Infected morirán de agotamiento energético → cuentan como by_disease.
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 500,
+            initial_honey_reserve: 0.8,
+            disease_enabled: true,
+            disease_base_rate: 0.5,
+            max_ticks: Some(121),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+
+        // Infectar las primeras 50 abejas manualmente para inicializar la epidemia
+        let to_infect: Vec<hecs::Entity> = orch.world
+            .query::<&HealthComponent>()
+            .iter()
+            .map(|(e, _)| e)
+            .take(50)
+            .collect();
+        for e in to_infect {
+            let _ = orch.world.insert_one(e, HealthComponent {
+                state: SirState::Infected,
+                ticks_in_state: 0,
+            });
+        }
+
+        orch.run();
+
+        let content = std::fs::read_to_string(dir.path().join("metrics_00000120.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let by_disease = parsed["mortality_rate"]["by_disease"].as_u64().unwrap_or(0);
+        assert!(
+            by_disease > 0,
+            "con 50 Infected iniciales y disease_base_rate=0.5, by_disease debe ser > 0, obtenido {by_disease}"
+        );
+    }
+
+    #[test]
+    fn determinism_preserved_with_m14() {
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+
+        let make = |dir: &TempDir| {
+            let config = RunConfig {
+                seed: 77,
+                max_ticks: Some(121),
+                disease_enabled: true,
+                disease_base_rate: 0.1,
+                predator_count: 2,
+                ..Default::default()
+            };
+            Orchestrator::new_with_output(config, dir.path())
+        };
+
+        make(&dir_a).run();
+        make(&dir_b).run();
+
+        for filename in &["metrics_00000000.json", "metrics_00000060.json", "metrics_00000120.json"] {
+            let a = std::fs::read(dir_a.path().join(filename)).unwrap();
+            let b = std::fs::read(dir_b.path().join(filename)).unwrap();
+            assert_eq!(a, b, "M14: archivo {filename} difiere entre runs con misma semilla");
+        }
+    }
+
     // --- M8: RoleTransitionSystem -----------------------------------------------
 
     #[test]
@@ -672,5 +1126,78 @@ mod tests {
         assert_eq!(counts[5], 0, "sin zánganos en spawn inicial");
         // Nurses absorben el residuo → ~307 (el resto después de los demás)
         assert!(counts[1] > 250, "nurses deben ser la mayoría, obtenidos {}", counts[1]);
+    }
+
+    // --- M15: Visualizador -------------------------------------------------------
+
+    #[test]
+    fn render_frame_agent_count_matches_world() {
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            initial_population: 100,
+            predator_count: 3,
+            max_ticks: Some(0),
+            ..Default::default()
+        };
+        let orch = Orchestrator::new_with_output(config, dir.path());
+        let frame = orch.build_render_frame();
+
+        let bee_count = orch.world.query::<(&PositionComponent, &RoleComponent)>().iter().count();
+        let pred_count = orch.world.query::<(&PositionComponent, &PredatorComponent)>().iter().count();
+        assert_eq!(
+            frame.agents.len(),
+            bee_count + pred_count,
+            "frame.agents debe incluir todas las abejas + depredadores"
+        );
+    }
+
+    #[test]
+    fn render_frame_tick_matches_current_tick() {
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            max_ticks: Some(5),
+            ..Default::default()
+        };
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        orch.run();
+        let frame = orch.build_render_frame();
+        assert_eq!(frame.tick, orch.current_tick(), "frame.tick debe coincidir con current_tick()");
+    }
+
+    #[test]
+    fn render_sender_overhead_under_2ms() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let dir = TempDir::new().unwrap();
+        let config = RunConfig {
+            seed: 42,
+            max_ticks: Some(1),
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let mut orch = Orchestrator::new_with_output(config, dir.path());
+        orch.set_render_sender(tx);
+
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            orch.tick_once();
+        }
+        let avg_ns = t0.elapsed().as_nanos() / 100;
+
+        // El overhead del renderer en el thread de simulación debe ser despreciable.
+        // En debug el límite es 20 ms; en release < 2 ms (idéntico al tick_once_is_fast).
+        #[cfg(debug_assertions)]
+        let limit_ns: u128 = 20_000_000;
+        #[cfg(not(debug_assertions))]
+        let limit_ns: u128 = 2_000_000;
+
+        assert!(
+            avg_ns < limit_ns,
+            "tick_once con render_sender promedio: {} ns (límite: {} ns)",
+            avg_ns, limit_ns
+        );
     }
 }

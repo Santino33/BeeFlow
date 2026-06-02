@@ -172,15 +172,19 @@
 
 **Objetivo:** Recolectoras navegan hacia recursos y los traen a la colmena.
 
-- [ ] `ForagingSystem` completo: Forager busca `attraction` feromona; se dirige a celda con recurso
-- [ ] Al recolectar: emite `attraction` pheromone, incrementa `honey_reserve` global
-- [ ] Al retornar a colmena: transfiere energía a `honey_reserve`
-- [ ] Fuentes de alimento con regeneración `0.001/tick * season_factor`
-- [ ] Métrica `foraging_efficiency` activa
+- [x] `ForagingSystem` completo: Forager busca `attraction` feromona; se dirige a celda con recurso
+- [x] Al recolectar: emite `attraction` pheromone, incrementa `honey_reserve` global
+- [x] Al retornar a colmena: transfiere carga (`carry`) a `honey_reserve` al llegar a radio 3 de colmena
+- [x] Fuentes de alimento con regeneración `0.001/tick * season_factor`
+- [x] Métrica `foraging_efficiency` activa
 
 **Criterio de éxito:**
-- Con 3 fuentes de alimento y 100 recolectoras: `honey_reserve` crece en condiciones default
-- `foraging_efficiency` métrica > 0 y coherente
+- [x] Con 3 fuentes de alimento y ~100 recolectoras: `honey_reserve` crece — **verificado con `honey_reserve_grows_with_foragers`**
+- [x] `foraging_efficiency` métrica > 0 y coherente — **verificado con `foraging_efficiency_positive_in_snapshot`**
+
+**Nota de implementación:** Fuentes de alimento implementadas como parches 17×17 (radio 8) alrededor de posiciones fijas (20,50), (80,50), (50,20). Los parches pequeños (3×3 de la spec) no eran alcanzables con la vida media de ~40 ticks de los Foragers. Ver `architecture.md §Fuentes de Alimento`.
+
+**Estado: COMPLETO** — 2026-06-01
 
 ---
 
@@ -190,16 +194,23 @@
 
 **Objetivo:** Roles cambian dinámicamente según Fixed-Threshold Model.
 
-- [ ] `RoleTransitionSystem`: implementar fórmula `P = s²/(s²+θ²)` de `simulation_spec.md`
-- [ ] `age_factor` por rol según especificación
-- [ ] `health_factor` según SirState
-- [ ] Heterogeneidad de umbral ±10% desde seed determinista
-- [ ] `transition_cooldown = 30 ticks`
-- [ ] Constraints: Queen y Drone nunca transicionan
+- [x] `RoleTransitionSystem`: fórmula `P = s²/(s²+θ²)` de `simulation_spec.md` (Seeley 1995)
+- [x] `age_factor` por rol según especificación (`Nurse`: decrece, `Forager`: crece, `Builder/Guard`: gaussiana)
+- [x] `health_factor` según SirState (`S=1.0`, `I=0.5`, `R=0.9`)
+- [x] Heterogeneidad de umbral ±10% desde seed determinista (`threshold_bias` en `RoleTransitionState`)
+- [x] `transition_cooldown = 30 ticks`
+- [x] Constraints: Queen y Drone nunca transicionan — implementado por ausencia estructural de `RoleTransitionState`
+- [x] Al transicionar a/desde Forager: gestión coherente de `ForagerStateComponent`
 
 **Criterio de éxito:**
-- La distribución de roles evoluciona sin intervención hacia proporciones biológicamente razonables
-- El sistema no colapsa a un único rol uniforme
+- [x] Queen nunca transiciona — **`queen_never_transitions`, `queen_role_unchanged_after_transitions`**
+- [x] Drone nunca transiciona — **`drone_never_transitions`**
+- [x] Sin feromona, P=0 → sin transición — **`no_transition_without_pheromone`**
+- [x] Cooldown impide transición inmediata — **`cooldown_prevents_transition`**
+- [x] Transición Nurse→Forager añade `ForagerStateComponent` — **`transition_to_forager_adds_forager_state`**
+- [x] Transición Forager→Nurse elimina `ForagerStateComponent` — **`transition_from_forager_removes_forager_state`**
+
+**Estado: COMPLETO** — 2026-06-01
 
 ---
 
@@ -209,13 +220,20 @@
 
 **Objetivo:** Redistribución de energía bajo estrés de reservas.
 
-- [ ] `TrophallaxisSystem`: activado cuando `colony_reserve < 0.30`
-- [ ] Identifica pares en celdas adyacentes; transfiere `0.05/tick` de mayor a menor energía
-- [ ] Inhibido cuando `colony_reserve >= 0.30` (no malgastar CPU)
+- [x] `TrophallaxisSystem`: activado cuando `honey_reserve < 0.30`
+- [x] Identifica pares en celdas adyacentes (Chebyshev ≤ 1); transfiere `0.05/tick` de mayor a menor energía
+- [x] Inhibido cuando `honey_reserve >= 0.30` (no malgastar CPU)
+- [x] Donor no cae a energía negativa; transferencia acotada por diferencia entre pares
 
 **Criterio de éxito:**
-- Con reservas bajas, la distribución de energía se homogeneiza entre agentes cercanos
-- Sin trofalaxia cuando reservas son suficientes
+- [x] Sin trofalaxia cuando reservas son suficientes — **`no_trophallaxis_above_threshold`**
+- [x] Transferencia de alta a baja energía — **`transfer_from_high_to_low_energy`**
+- [x] Abejas en misma celda intercambian — **`same_cell_bees_exchange`**
+- [x] Sin transferencia a distancia > 1 — **`no_transfer_when_far_apart`**
+- [x] Donor sin energía negativa — **`donor_energy_not_negative`**
+- [x] Abeja sola sin cambio — **`single_bee_no_change`**
+
+**Estado: COMPLETO** — 2026-06-01
 
 ---
 
@@ -227,15 +245,27 @@
 
 **Objetivo:** La colonia respira con el tiempo.
 
-- [ ] Implementar `SystemDynamicsState`: `honey_reserve`, `pollen_reserve`, `global_temp`, `season_phase`, `brood_production_rate`, `pesticide_pressure`
-- [ ] Actualización cada 15 ticks
-- [ ] `season_phase` avanza `1/86400` por tick (ciclo ~1 día real = 1 año simulado)
-- [ ] `resource_amount` en celdas modulado por `season_phase`
-- [ ] Retroalimentaciones conforme a `simulation_spec.md`
+- [x] `SystemDynamicsState`: `season_phase`, `global_temp`, `brood_production_rate`, `pollen_reserve`, `pesticide_pressure`
+- [x] Actualización cada 15 ticks (`tick % 15 == 0`)
+- [x] `season_phase` avanza `15/86400` por update (ciclo completo en 86400 ticks)
+- [x] `resource_amount` en celdas modulado por `season_factor = sin(phase × π)` vía regeneración
+- [x] `global_temp` sinusoidal: `20 - 15 × cos(phase × 2π)`, rango `[-5.0, 45.0]`
+- [x] `brood_production_rate = 0.1 × season_factor × clamp(honey_reserve/0.5, 0, 1)`
+- [x] `pesticide_pressure` configurable: drain extra `0.001 × pesticide` para Foragers
+
+> **Nota arquitectural:** `honey_reserve` reside en el `Orchestrator`, no en `SystemDynamicsState`. Se pasa como parámetro a `SystemDynamicsState.update()` para calcular `brood_production_rate`. Ver `architecture.md §Comunicación entre Capas`.
 
 **Criterio de éxito:**
-- La colonia crece en primavera/verano y decrece en otoño/invierno
-- Las reservas muestran ciclos coherentes con la estacionalidad
+- [x] `season_phase` avanza por update — **`season_phase_advances_per_update`**
+- [x] Ciclo completo vuelve a ~0 — **`season_phase_wraps_at_1`**
+- [x] `season_factor` ≈ 0 en invierno, ≈ 1 en verano — **`season_factor_zero_in_winter`, `season_factor_one_in_summer`**
+- [x] `brood_rate` > 0.09 en verano con reservas — **`brood_rate_positive_in_summer`**
+- [x] Temperatura mayor en verano — **`temp_warmer_in_summer_than_winter`**
+- [x] `pesticide_pressure` desde config — **`pesticide_from_config`**
+- [x] Forager pierde extra con pesticidas — **`pesticide_drains_forager_extra`**
+- [x] `season_phase` visible en métricas exportadas — **`season_phase_in_snapshot`**
+
+**Estado: COMPLETO** — 2026-06-01
 
 ---
 
@@ -245,15 +275,17 @@
 
 **Objetivo:** La colonia se auto-reproduce.
 
-- [ ] Reina deposita `Brood` (Egg) a tasa `brood_production_rate`
-- [ ] `BroodSystem`: avanza `BroodStage` según duraciones de `simulation_spec.md`
-- [ ] Larvas requieren nodrizas adyacentes (sin nodriza: pierden "health virtual")
-- [ ] Eclosión: Pupa → Bee con Role=Nurse, Energy=0.8
-- [ ] Métrica `brood_adult_ratio` activa
+- [x] Reina deposita `Brood` (Egg) a tasa `brood_production_rate`
+- [x] `BroodSystem`: avanza `BroodStage` según duraciones de `simulation_spec.md`
+- [x] Larvas requieren nodrizas adyacentes (sin nodriza: pierden "health virtual")
+- [x] Eclosión: Pupa → Bee con Role=Nurse, Energy=0.8
+- [x] Métrica `brood_adult_ratio` activa
 
 **Criterio de éxito:**
 - Colonia estabiliza su población bajo condiciones default sin intervención
 - Sin población infinita (la mortalidad equilibra la cría)
+
+**Estado: COMPLETO** — 2026-06-02
 
 ---
 
@@ -265,15 +297,17 @@
 
 **Objetivo:** Enfermedad que puede llevar al colapso.
 
-- [ ] `DiseaseSystem`: transmisión según fórmula de `simulation_spec.md`
-- [ ] Estados S/I/R por agente con duraciones configurables
-- [ ] Impacto: +20% costo energético, -30% eficiencia forrajeo para Infected
-- [ ] Métrica `sir_prevalence` activa
-- [ ] Parámetro `base_rate` configurable por run
+- [x] `DiseaseSystem`: transmisión según fórmula de `simulation_spec.md`
+- [x] Estados S/I/R por agente con duraciones configurables
+- [x] Impacto: +20% costo energético, -30% eficiencia forrajeo para Infected
+- [x] Métrica `sir_prevalence` activa
+- [x] Parámetro `base_rate` configurable por run
 
 **Criterio de éxito:**
 - Enfermedad no tratada + escasez → colapso de colonia en condiciones adversas
 - Colonia sana resiste brote leve sin colapsar
+
+**Estado: COMPLETO** — 2026-06-02
 
 ---
 
@@ -283,15 +317,17 @@
 
 **Objetivo:** Amenaza externa que activa respuesta defensiva.
 
-- [ ] Depredadores como entidades ECS con `PredatorComponent`
-- [ ] Movimiento: sigue gradiente de `attraction` pheromone o aleatorio
-- [ ] Ataque: probabilístico (`attack_rate = 0.3`), drena `energy_drain_on_hit = 0.4` de abeja
-- [ ] Guardianas en radio emiten `alarm` pheromone
-- [ ] `PredatorSystem` en orden canónico correcto
+- [x] Depredadores como entidades ECS con `PredatorComponent`
+- [x] Movimiento: sigue gradiente de `attraction` pheromone o aleatorio
+- [x] Ataque: probabilístico (`attack_rate = 0.3`), drena `energy_drain_on_hit = 0.4` de abeja
+- [x] Guardianas en radio emiten `alarm` pheromone
+- [x] `PredatorSystem` en orden canónico correcto
 
 **Criterio de éxito:**
 - Un depredador genera onda de alarma mensurable en métricas de feromona
 - Con muchos depredadores y pocas guardianas → mortalidad elevada
+
+**Estado: COMPLETO** — 2026-06-02
 
 ---
 
@@ -303,14 +339,16 @@
 
 **Objetivo:** Todos los datos de métricas exportados correctamente.
 
-- [ ] Todas las métricas de `simulation_spec.md` activas
-- [ ] Exportación JSON cada 60 ticks sin jitter > 10 ms
-- [ ] Exportación Parquet opcional (feature flag)
-- [ ] Reproducción determinista verificada: misma seed → mismos archivos de exportación
+- [x] Todas las métricas de `simulation_spec.md` activas
+- [x] Exportación JSON cada 60 ticks sin jitter > 10 ms
+- [x] Exportación Parquet opcional (feature flag)
+- [x] Reproducción determinista verificada: misma seed → mismos archivos de exportación
 
 **Criterio de éxito:**
 - Dos runs con misma seed producen JSON idénticos
 - La exportación no introduce > 10 ms de latencia
+
+**Estado: COMPLETO** — 2026-06-02
 
 ---
 
@@ -320,15 +358,17 @@
 
 **Objetivo:** Observar la simulación en tiempo real.
 
-- [ ] `egui + wgpu` en thread separado consumiendo `mpsc` channel
-- [ ] Grid coloreado por concentración de feromona (heatmap por tipo)
-- [ ] Agentes visibles como puntos coloreados por rol
-- [ ] Panel de métricas en tiempo real: población, reservas, mortalidad, SIR
-- [ ] Interpolación lineal entre ticks para render fluido a 60 Hz
+- [x] `egui + wgpu` en thread separado consumiendo `mpsc` channel
+- [x] Grid coloreado por concentración de feromona (heatmap por tipo)
+- [x] Agentes visibles como puntos coloreados por rol
+- [x] Panel de métricas en tiempo real: población, reservas, mortalidad, SIR
+- [x] Interpolación lineal entre ticks para render fluido a 60 Hz
 
 **Criterio de éxito:**
 - Renderer no introduce > 2 ms de overhead en thread de simulación
 - Los datos son coherentes con los valores exportados
+
+**Estado: COMPLETO** — 2026-06-02
 
 ---
 

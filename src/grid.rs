@@ -170,6 +170,14 @@ impl SpatialGrid {
         &self.phero[kind.index()][self.read_buf]
     }
 
+    /// Acceso de solo lectura al buffer de escritura para un canal.
+    /// Contiene las emisiones frescas del tick actual (add_pheromone escribe aquí).
+    #[inline]
+    pub fn pheromone_write_slice(&self, kind: PheromoneKind) -> &[f32] {
+        let write_buf = 1 - self.read_buf;
+        &self.phero[kind.index()][write_buf]
+    }
+
     /// Acceso mutable al buffer de escritura para un canal (usado por M2 para difusión).
     #[inline]
     pub fn pheromone_write_slice_mut(&mut self, kind: PheromoneKind) -> &mut [f32] {
@@ -186,6 +194,10 @@ impl SpatialGrid {
         let ch = kind.index();
         let rb = self.read_buf;
         let wb = 1 - rb;
+        // Invariante: read_buf ∈ {0,1}, swap mediante XOR → rb ≠ wb siempre.
+        debug_assert!(rb < 2, "read_buf debe ser 0 o 1, obtenido {rb}");
+        debug_assert!(wb < 2, "write_buf debe ser 0 o 1, obtenido {wb}");
+        debug_assert_ne!(rb, wb, "read_buf y write_buf no pueden coincidir");
         let read_ptr = self.phero[ch][rb].as_ptr();
         let read_len = self.phero[ch][rb].len();
         let obs_ptr = self.is_obstacle.as_ptr();
@@ -195,6 +207,46 @@ impl SpatialGrid {
         let obstacles = unsafe { std::slice::from_raw_parts(obs_ptr, obs_len) };
         let write = &mut self.phero[ch][wb];
         (read, write, obstacles)
+    }
+
+    /// Devuelve los buffers de los 3 canales simultáneamente para difusión paralela.
+    /// Cada elemento `(read, write)` corresponde al canal de índice `PheromoneKind as usize`.
+    /// Para uso exclusivo de `DiffusionSystem::step`.
+    ///
+    /// # Safety
+    /// `phero[i][rb]` y `phero[i][wb]` son Vecs con asignaciones independientes (`rb ≠ wb`).
+    /// `phero[0]`, `phero[1]`, `phero[2]` son elementos disjuntos del array → sin aliasing.
+    /// `is_obstacle` es un campo separado de `phero` → sin aliasing con ningún canal.
+    pub fn all_channel_bufs_for_diffusion(
+        &mut self,
+    ) -> ([(&[f32], &mut [f32]); 3], &[bool]) {
+        let rb = self.read_buf;
+        let wb = 1 - rb;
+        debug_assert!(rb < 2, "read_buf debe ser 0 o 1, obtenido {rb}");
+        debug_assert!(wb < 2, "write_buf debe ser 0 o 1, obtenido {wb}");
+        debug_assert_ne!(rb, wb, "read_buf y write_buf no pueden coincidir");
+
+        // Recogemos punteros crudos secuencialmente (cada préstamo se libera tras la sentencia).
+        let r0_ptr = self.phero[0][rb].as_ptr(); let r0_len = self.phero[0][rb].len();
+        let w0_ptr = self.phero[0][wb].as_mut_ptr(); let w0_len = self.phero[0][wb].len();
+        let r1_ptr = self.phero[1][rb].as_ptr(); let r1_len = self.phero[1][rb].len();
+        let w1_ptr = self.phero[1][wb].as_mut_ptr(); let w1_len = self.phero[1][wb].len();
+        let r2_ptr = self.phero[2][rb].as_ptr(); let r2_len = self.phero[2][rb].len();
+        let w2_ptr = self.phero[2][wb].as_mut_ptr(); let w2_len = self.phero[2][wb].len();
+        let obs_ptr = self.is_obstacle.as_ptr(); let obs_len = self.is_obstacle.len();
+
+        // SAFETY: ver doc del método. Idéntico razonamiento a `channel_bufs_mut`.
+        unsafe {
+            let obs = std::slice::from_raw_parts(obs_ptr, obs_len);
+            ([
+                (std::slice::from_raw_parts(r0_ptr, r0_len),
+                 std::slice::from_raw_parts_mut(w0_ptr, w0_len)),
+                (std::slice::from_raw_parts(r1_ptr, r1_len),
+                 std::slice::from_raw_parts_mut(w1_ptr, w1_len)),
+                (std::slice::from_raw_parts(r2_ptr, r2_len),
+                 std::slice::from_raw_parts_mut(w2_ptr, w2_len)),
+            ], obs)
+        }
     }
 
     // -----------------------------------------------------------------------

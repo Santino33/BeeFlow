@@ -3,6 +3,15 @@ name = "beeflow"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Habilita exportación en formato Parquet (requiere instalar parquet + arrow-array).
+# Uso: cargo build --features parquet-export
+parquet-export = []
+# Habilita el visualizador egui+wgpu en tiempo real.
+# Uso: cargo run --features visualizer
+visualizer = ["dep:eframe"]
+
 [profile.release]
 lto = true
 codegen-units = 1
@@ -21,6 +30,7 @@ rand             = "0.8"
 rand_xoshiro     = "0.6"
 serde            = { version = "1", features = ["derive"] }
 serde_json       = "1"
+eframe           = { version = "0.28", optional = true, default-features = false, features = ["wgpu", "default_fonts"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

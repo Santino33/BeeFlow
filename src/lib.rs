@@ -7,3 +7,4 @@ pub mod orchestrator;
 pub mod rng;
 pub mod system_dynamics;
 pub mod systems;
+pub mod visualizer;
