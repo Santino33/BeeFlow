@@ -377,8 +377,18 @@ fn spawn_initial_population(
     let mut rng = rng_system.global_rng();
     // RNG separado para biases de umbral: usa sentinel distinto para no perturbar secuencia de posiciones.
     let mut bias_rng = rng_system.tick_rng(u64::MAX);
-    let lo = BORDER;
-    let hi = GRID_W - BORDER;
+    // Radio de spawn para roles de colmena (Nurse/Guard/Builder) — se mantienen cerca del nido
+    const HIVE_SPAWN_RADIUS: usize = 12;
+    // Radio de spawn para forrajeadoras — algo más amplio para simular que ya patrullan
+    const FORAGER_SPAWN_RADIUS: usize = 15;
+    let hive_lo_x = HIVE_X.saturating_sub(HIVE_SPAWN_RADIUS);
+    let hive_hi_x = (HIVE_X + HIVE_SPAWN_RADIUS + 1).min(GRID_W - BORDER);
+    let hive_lo_y = HIVE_Y.saturating_sub(HIVE_SPAWN_RADIUS);
+    let hive_hi_y = (HIVE_Y + HIVE_SPAWN_RADIUS + 1).min(GRID_W - BORDER);
+    let forager_lo_x = HIVE_X.saturating_sub(FORAGER_SPAWN_RADIUS);
+    let forager_hi_x = (HIVE_X + FORAGER_SPAWN_RADIUS + 1).min(GRID_W - BORDER);
+    let forager_lo_y = HIVE_Y.saturating_sub(FORAGER_SPAWN_RADIUS);
+    let forager_hi_y = (HIVE_Y + FORAGER_SPAWN_RADIUS + 1).min(GRID_W - BORDER);
 
     // 1 Queen — posición fija en la colmena
     let hive_idx = SpatialGrid::idx(HIVE_X, HIVE_Y);
@@ -405,14 +415,14 @@ fn spawn_initial_population(
 
     // Nodrizas, Guardianas, Constructoras — con RoleTransitionState (M8)
     let non_forager_roles = [
-        (Role::Nurse,   n_nurses,   PheromoneSensitivity([0.0, 1.0, 0.0])),
-        (Role::Guard,   n_guards,   PheromoneSensitivity([1.0, 0.0, 0.0])),
-        (Role::Builder, n_builders, PheromoneSensitivity([0.0, 1.0, 0.0])),
+        (Role::Nurse,   n_nurses,   PheromoneSensitivity([0.0, 5.0, 0.0])),
+        (Role::Guard,   n_guards,   PheromoneSensitivity([5.0, 0.0, 0.0])),
+        (Role::Builder, n_builders, PheromoneSensitivity([0.0, 5.0, 0.0])),
     ];
     for (role, c, sensitivity) in non_forager_roles {
         for _ in 0..c {
-            let x = rng.gen_range(lo..hi) as u16;
-            let y = rng.gen_range(lo..hi) as u16;
+            let x = rng.gen_range(hive_lo_x..hive_hi_x) as u16;
+            let y = rng.gen_range(hive_lo_y..hive_hi_y) as u16;
             let idx = SpatialGrid::idx(x as usize, y as usize);
             grid.occupancy[idx] = grid.occupancy[idx].saturating_add(1);
             let bias: f32 = bias_rng.gen::<f32>() * 0.2 - 0.1;
@@ -430,8 +440,8 @@ fn spawn_initial_population(
 
     // Recolectoras — con ForagerStateComponent (M7) y RoleTransitionState (M8)
     for _ in 0..n_foragers {
-        let x = rng.gen_range(lo..hi) as u16;
-        let y = rng.gen_range(lo..hi) as u16;
+        let x = rng.gen_range(forager_lo_x..forager_hi_x) as u16;
+        let y = rng.gen_range(forager_lo_y..forager_hi_y) as u16;
         let idx = SpatialGrid::idx(x as usize, y as usize);
         grid.occupancy[idx] = grid.occupancy[idx].saturating_add(1);
         let bias: f32 = bias_rng.gen::<f32>() * 0.2 - 0.1;
@@ -441,7 +451,7 @@ fn spawn_initial_population(
             EnergyComponent(0.8),
             HealthComponent { state: SirState::Susceptible, ticks_in_state: 0 },
             AgeComponent(0),
-            PheromoneSensitivity([0.0, 0.0, 1.0]),
+            PheromoneSensitivity([0.0, 0.0, 5.0]),
             ForagerStateComponent(ForagerPhase::Searching),
             RoleTransitionState { cooldown: 0, threshold_bias: bias },
         ));

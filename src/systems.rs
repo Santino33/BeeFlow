@@ -17,6 +17,10 @@ pub const FORAGER_CARRY_MAX: f32 = 1.0;
 /// Radio Manhattan al que un Forager deposita su carga en la colmena.
 pub const HIVE_DEPOSIT_RADIUS: u32 = 8;
 
+/// Multiplicador de peso para celdas que acercan a Nurse/Builder/Guard a la colmena.
+/// Crea una "gravedad" que mantiene los roles de colmena concentrados cerca del nido.
+pub const HIVE_GRAVITY_WEIGHT: f32 = 3.0;
+
 /// Tasa de emisión de feromona de atracción al recolectar (simulation_spec.md §Feromonas).
 pub const FORAGER_PHEROMONE_EMISSION: f32 = 0.15;
 
@@ -89,12 +93,29 @@ pub fn run_movement_system(
                 _                         => None,
             });
 
+            // Gravedad de colmena: Nurse/Builder/Guard prefieren celdas que acercan al nido
+            let is_hive_role = matches!(
+                role.map(|r| r.0),
+                Some(Role::Nurse | Role::Builder | Role::Guard)
+            );
+            let hive_xi = HIVE_X as i32;
+            let hive_yi = HIVE_Y as i32;
+            let cur_dist_hive = manhattan(x as i32, y as i32, hive_xi, hive_yi);
+
             if let (Some(kind), Some(sensitivity)) = (pheromone_kind, sens) {
                 let channel_sens = sensitivity.0[kind as usize];
                 if channel_sens > 0.0 {
                     let weights: arrayvec::ArrayVec<f32, 8> = valid
                         .iter()
-                        .map(|&(nx, ny)| 1.0_f32 + grid.pheromone(nx, ny, kind) * channel_sens)
+                        .map(|&(nx, ny)| {
+                            let base = 1.0_f32 + grid.pheromone(nx, ny, kind) * channel_sens;
+                            if is_hive_role {
+                                let next_dist = manhattan(nx as i32, ny as i32, hive_xi, hive_yi);
+                                if next_dist < cur_dist_hive { base * HIVE_GRAVITY_WEIGHT } else { base }
+                            } else {
+                                base
+                            }
+                        })
                         .collect();
                     let total: f32 = weights.iter().sum();
                     let mut pick = agent_rng.gen::<f32>() * total;
@@ -105,8 +126,37 @@ pub fn run_movement_system(
                             pick <= 0.0
                         })
                         .unwrap_or(valid.len() - 1)
+                } else if is_hive_role {
+                    // Sin feromona pero con gravedad: preferir celdas más cercanas a la colmena
+                    let closer: arrayvec::ArrayVec<usize, 8> = valid
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &(nx, ny))| {
+                            manhattan(nx as i32, ny as i32, hive_xi, hive_yi) < cur_dist_hive
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    if closer.is_empty() {
+                        agent_rng.gen_range(0..valid.len())
+                    } else {
+                        closer[agent_rng.gen_range(0..closer.len())]
+                    }
                 } else {
                     agent_rng.gen_range(0..valid.len())
+                }
+            } else if is_hive_role {
+                let closer: arrayvec::ArrayVec<usize, 8> = valid
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &(nx, ny))| {
+                        manhattan(nx as i32, ny as i32, hive_xi, hive_yi) < cur_dist_hive
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if closer.is_empty() {
+                    agent_rng.gen_range(0..valid.len())
+                } else {
+                    closer[agent_rng.gen_range(0..closer.len())]
                 }
             } else {
                 agent_rng.gen_range(0..valid.len())
